@@ -37,7 +37,7 @@ defaults:
   tensor_parallel: 2
   pipeline_parallel: 1
   gpu_memory_utilization: 0.86
-  max_model_len: 200000
+  max_model_len: 500000
   max_num_batched_tokens: 8192
   max_num_seqs: 8
 
@@ -103,7 +103,7 @@ command: |
       --block-size 32 \
       --attention-backend triton_attn_diffkv \
       --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"],"attention_chunk_size":null}}' \
-      --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
+      --limit-mm-per-prompt '{{"image":2,"video":0,"audio":1}}' \
       --host {host} \
       --port {port} \
       --tensor-parallel-size {tensor_parallel} \

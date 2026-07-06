@@ -27,16 +27,23 @@ correctly and fast on dual GB10.
 
 | Metric | Value |
 |---|---|
-| KV-cache pool (util 0.86, mml 200K) | ~240K–760K tokens (up to 5.8× bf16). The pool is sized from **free memory at KV-profiling time**, so co-resident services and boot-to-boot memory state move it a lot on GB10 unified memory. Measure it with your real service load online — don't strip services to inflate it (that just moves the OOM to later). |
-| Single-stream decode | code ~33–44 / JSON ~52 / prose ~24–28 tok/s |
-| Deep-context decode (200K) | ~23 tok/s (per-step ~167ms; full-attention O(ctx) growth is physics) |
-| Multi-stream (code, mns=8, cudagraph) | 1: 33 · 2: 52 (28 ea) · 4: 69 (20 ea) · 8: 111 tok/s aggregate. Speculative decode is single-stream-latency optimized, so aggregate scales sub-linearly. |
+| KV-cache pool (util 0.86, mml 500K, **`limit-mm-per-prompt video:0`**) | **~1.5M tokens** (3.18× a 500K request). The single biggest lever was *not* the KV format — it was dropping the multimodal **video worst-case from startup profiling** (`{"image":2,"video":0,"audio":1}`), which was reserving ~10.6 GiB/rank of encoder-cache; that reservation is what capped the pool at ~236K. Measure with your real service load online — don't strip services to inflate it. |
+| Long context | validated to **240K real tokens with correct needle recall**; `max_model_len=500000` |
+| Short-context decode | JSON ~48–52 / code ~44 tok/s |
+| Multi-stream (code, mns=8, cudagraph) | 1: 33 · 2: 52 (28 ea) · 4: 69 (20 ea) · 8: 111 tok/s aggregate (sub-linear — see below) |
+| **Deep decode, honest** (real prose, **real temperature**, thinking-off) | 100K: 12 · 200K: 10 · 300K: 5 · 400K: 4 tok/s. Prefill ≈ 0.8 s / 1K tokens (400K ≈ 5 min cold). |
 | Tool-calling quality (tool-eval-bench) | 90 / ★★★★★ Excellent, 0 safety warnings |
 | Reliability (reliability-bench v1_full) | on par with the fp16/fp8 baseline (existence 24/24, refusal 9/9) |
 
-Speculative decoding is single-stream-latency optimized: the per-stream drafter cost does not
-amortize across concurrent requests, so aggregate throughput scales sub-linearly (great for
-"one big stream + a few side streams", less so for many-way batching).
+**Measure honestly.** Two traps we fell into and fixed: (1) `temperature=0` + repetitive/synthetic
+prompts *inflate* speculative-decoding accept-length and overstate tok/s — measure at your real
+serving temperature with real, non-repetitive content; (2) speculative decode streams **per step,
+not per token**, so count tokens via `usage.completion_tokens` (`stream=False`), never by counting
+SSE chunks. Under real conditions the DFlash speedup largely collapses on unpredictable prose, and
+deep-context decode is bounded by full-attention O(context) growth — 500K context is usable
+(works, recalls) but slow to decode at depth. Speculative decode is single-stream-latency
+optimized: the per-stream drafter cost does not amortize across concurrent requests, so aggregate
+throughput scales sub-linearly (good for "one big stream + a few side streams").
 
 ## Hardware
 
