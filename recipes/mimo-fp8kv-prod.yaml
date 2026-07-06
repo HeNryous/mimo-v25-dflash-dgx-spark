@@ -1,0 +1,124 @@
+recipe_version: "1"
+name: MiMo-DFlash-Upstream-fp8KV
+description: >
+  MiMo-V2.5 + DFlash drafter, fp8-e4m3 KV cache (~2x larger KV pool than bf16),
+  on the UPSTREAM vLLM image (vllm 0.23.1rc1.dev760+g3775d5fca). The
+  mods/fp8-kv-inline graft (cloned from the nvfp4 INLINE machinery) adds the fp8
+  DiffKV path: NATIVE fp8 store (triton_reshape_and_cache_flash_diffkv) + an
+  IN-KERNEL descale read (bitcast uint8 -> float8e4nv -> bf16 x per-tensor
+  descale, VLLM_FP8_INLINE=1). fp8 dequant is a bitcast + one multiply, measured
+  3.5-4.8x FASTER than the nvfp4 INLINE arm at q_len=8 (no nibble-unpack /
+  e2m1-LUT / block-scale), so deep-context decode stays near bf16 speed while the
+  pool is ~2x bf16 (fp8 page 320 B = HALF bf16 640 B). Correctness verified
+  offline: store->load parity ~2.4e-3, inherent fp8 error ~0.027 vs bf16, q_len=8
+  (DFlash) bit-exact vs bf16 kernel. fp8 needs NO page-size patch (native 320 B,
+  alloc==view) -- only the FP8_KV_INLINE_SPEC quant_mode/uint8 self-heal (MiMo
+  never threads cache_config). nvfp4 mods stay in the list but are INERT here
+  (they gate on cache_dtype "nvfp4"; this recipe uses "fp8"). MiMo model +
+  DFlash + SWA + #40727 aux + scheduler lookahead are all NATIVE. Fast-iteration
+  boot profile: eager, util 0.88, mml 65536, mns 1, instanttensor.
+model: /root/.cache/huggingface/MiMo-oproj-mxfp8
+container: vllm-node-mimo-v25-upstream
+
+mods:
+  - mods/drop-caches
+  - mods/fix-mimo-v2-upstream
+  - mods/nvfp4-draft-bf16
+  - mods/nvfp4-draft-blocksize
+  - mods/fp8-kv-inline
+  - mods/ray-cvd-fallback
+  - mods/omni-eagle3
+  - mods/mimo-chat-template
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: MiMo-V2.5-NVFP4 mimo-dflash-test
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.86
+  max_model_len: 200000
+  max_num_batched_tokens: 8192
+  max_num_seqs: 8
+
+env:
+  # --- passthrough OS env (NCCL / Ray / torch) — not gated by vllm/envs.py ---
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  NCCL_CROSS_NIC: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_NVLS_ENABLE: "0"
+  RAY_memory_monitor_refresh_ms: "0"
+  RAY_DEDUP_LOGS: "0"
+  PYTHONFAULTHANDLER: "1"
+  # --- vLLM envs — all verified present in this image's vllm/envs.py ---
+  VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  # Force Ray Compiled-Graph transport to shared memory (host), NOT the
+  # NCCL/GPU accelerator channel. On this upstream image the V1 legacy Ray
+  # executor ALWAYS compiles a Ray DAG (ray_executor.py _execute_dag ->
+  # experimental_compile); vLLM sets RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+  # so workers leave CUDA_VISIBLE_DEVICES UNSET. Ray's default channel_type=auto
+  # then upgrades intra-node TP to the NCCL accelerator channel, whose setup calls
+  # AcceleratorContext.get_accelerator_devices() -> [].index('0') ->
+  # ValueError: '0' is not in list -> RuntimeError: CUDA_VISIBLE_DEVICES set
+  # incorrectly (crash at first forward on the worker). shm keeps
+  # requires_accelerator()=False so that device lookup is never reached, and does
+  # NOT touch vLLM's internal TP NCCL (only the tiny scheduler-output DAG handoff
+  # moves via host shm). Same escape hatch vLLM itself uses for TPU/XPU
+  # (ray_executor.py: sets shm 'to avoid compiling NVIDIA's NCCL').
+  VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: "shm"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_LOGGING_LEVEL: "INFO"
+  # INLINE nvfp4 dequant fast-path (mods/nvfp4-kv-upstream INLINE graft): dequant
+  # nvfp4 K/V INSIDE the DiffKV Triton kernel KV-load (per-tile, in-register) --
+  # eliminates the SCRATCH O(context) full-block bf16 re-dequant per decode step
+  # AND its transient bf16 buffer (the ~1 GiB near-OOM). Fires at ANY q_len so
+  # DFlash q_len=8 is fine (WMMA is q_len<=3-gated, never fires here). Numerically
+  # bit-identical to SCRATCH (rel-err 0 / ~1e-6). Set to "0" to A/B back to SCRATCH.
+  VLLM_NVFP4_INLINE: "1"
+  # fp8 in-kernel descale fast-path (mods/fp8-kv-inline): dequant fp8-e4m3 K/V
+  # INSIDE the DiffKV Triton kernel KV-load (bitcast uint8 -> float8e4nv -> bf16
+  # x per-tensor descale). Measured 3.5-4.8x faster than the nvfp4 INLINE arm at
+  # q_len=8 (no unpack/LUT/blockscale). Descales default to 1.0
+  # (calculate_kv_scales False). Set to "0" to A/B back to the bf16-dequant
+  # SCRATCH fallback.
+  VLLM_FP8_INLINE: "1"
+  # NOTE: the dev114 MoE-FP4 env trio (VLLM_NVFP4_GEMM_BACKEND,
+  # VLLM_USE_FLASHINFER_MOE_FP4, VLLM_FLASHINFER_MOE_BACKEND) was REMOVED from
+  # this image's envs.py (refactored away on main; no code references them).
+  # Setting them would be silently ignored, so they are intentionally dropped —
+  # the NVFP4 MoE dispatch is now auto-selected by the modelopt quant method.
+  # (Also dropped: all VLLM_WMMA_* / VLLM_TK_* / VLLM_QUEST* / VLLM_NVFP4_INLINE
+  # / VLLM_DFLASH_* / TK_INC / CUDA_LAUNCH_BLOCKING / DEBUG — WMMA/TK/Quest not
+  # used on the fp8-KV path; DFlash SWA/sink/vscale are native.)
+
+command: |
+  vllm serve /root/.cache/huggingface/MiMo-oproj-mxfp8 \
+      --served-model-name {served_model_name} \
+      --trust-remote-code \
+      --dtype auto \
+      --kv-cache-dtype fp8 \
+      --block-size 32 \
+      --attention-backend triton_attn_diffkv \
+      --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"],"attention_chunk_size":null}}' \
+      --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --distributed-executor-backend ray \
+      --speculative-config '{{"method":"dflash","model":"/root/.cache/huggingface/mimo-dflash/dflash","num_speculative_tokens":7,"attention_backend":"TRITON_ATTN"}}' \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --compilation-config '{{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,48,64]}}' \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --load-format auto \
+      --enable-auto-tool-choice \
+      --tool-call-parser mimo \
+      --reasoning-parser mimo \
+      --chat-template /root/mimo_chat_template.jinja

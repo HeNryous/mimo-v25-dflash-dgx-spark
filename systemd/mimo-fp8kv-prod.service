@@ -1,0 +1,30 @@
+[Unit]
+Description=MiMo-V2.5-DFlash fp8-KV (upstream vLLM, DFlash spec-decode, cudagraph, TP=2) — PROD daily-driver :8000
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/spark-vllm-docker
+
+# Full memory cleanup: stop vllm_node both nodes + UVM reset + drop_caches (max clean pool)
+ExecStartPre=/usr/local/bin/mimo-fp8kv-pre-start.sh
+
+ExecStart=/home/admin/spark-vllm-docker/run-recipe.sh -d recipes/mimo-fp8kv-prod.yaml
+
+ExecStop=-/usr/bin/docker stop vllm_node
+ExecStop=-/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=no 10.0.0.2 docker stop vllm_node
+ExecStopPost=-/bin/sh -c 'echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null'
+ExecStopPost=-/bin/sh -c 'ssh -o BatchMode=yes -o StrictHostKeyChecking=no 10.0.0.2 "echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null"'
+
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
