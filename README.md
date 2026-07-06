@@ -44,6 +44,39 @@ amortize across concurrent requests, so aggregate throughput scales sub-linearly
 - Cross-node interconnect for NCCL (RoCE)
 - Head node (rank 0) + worker (rank 1), TP=2 over Ray
 
+## Base image & build environment
+
+The recipe runs inside a locally-built vLLM image; the `mods/` reproduce the exact deltas on
+top of upstream vLLM, so the setup is reproducible from an equivalent build.
+
+| | |
+|---|---|
+| Base image | `vllm-node-mimo-v25-upstream` (local build), 19.4 GB, **linux/arm64** |
+| vLLM | `0.23.1rc1.dev760+g3775d5fca` (upstream `main` @ 3775d5fca, ~2026-07-05, post PR #46104) |
+| CUDA | 13.2.0 (`NVIDIA_REQUIRE_CUDA cuda>=13.2`, driver ≥ 535) · Python 3.12 |
+| GPU arch | NVIDIA GB10 (Grace-Blackwell), **sm_121a**, ARM64 host, 128 GiB unified memory/node |
+| Weights on GPU | ~86.9 GiB/rank (MoE nvfp4 + o_proj MXFP8) |
+
+**Already native in this vLLM build** (the mods do NOT re-add these): `TRITON_ATTN_DIFFKV`
+attention backend (PR #41797); `MiMoV2` / `MiMoV2Omni` / `DFlashDraftModel` in the model
+registry; DFlash aux+1 / SWA window symmetrization (#40727).
+
+**What the mods add on top** (upstream still lacks these for this exact fp8-KV + DFlash path):
+- `fp8-kv-inline` — accept fp8 KV in the DiffKV Triton backend + in-kernel bitcast+multiply descale
+- `fix-mimo-v2-upstream` — `MimoV2Config` HF registration + Omni audio deps (soundfile/librosa/av)
+- `mimo-chat-template` — MiMo chat template (bounded reasoning) + reasoning parser
+- `nvfp4-draft-bf16` / `nvfp4-draft-blocksize` — force the DFlash drafter KV to bf16 / block-16 (anti-padding)
+- `ray-cvd-fallback` — Ray accelerator ordinal fallback (fixes a CUDA_VISIBLE_DEVICES crash under TP)
+
+**Model artifacts** (not in this repo — pull / quantize separately):
+- Target: **MiMo-V2.5** quantized `modelopt_mixed` (NVFP4 MoE + o_proj MXFP8), served from `MiMo-oproj-mxfp8`
+- Drafter: **DFlash** (5-layer Qwen3, non-causal, sliding-window 1024), `num_speculative_tokens=7`
+- Served under two aliases: `MiMo-V2.5-NVFP4` and `mimo-dflash-test`
+
+> The base image itself is not published (it's a large local CUDA build). To reproduce: build
+> upstream vLLM `main` @ ~3775d5fca for CUDA 13.2 / sm_121, then apply the `mods/` at container
+> start (each mod is a marker-guarded, idempotent `run.sh` that patches site-packages in place).
+
 ## Repository layout
 
 ```
