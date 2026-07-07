@@ -6,6 +6,7 @@ An optimized [vLLM](https://github.com/vllm-project/vllm) serving recipe for run
 
 - **DFlash speculative decoding** (5-layer Qwen3 drafter, `num_speculative_tokens=7`) — ~2× single-stream throughput
 - **fp8 (e4m3) KV cache** with an in-kernel descale fast-path — **~5.8× larger KV pool** than bf16, at negligible quality cost (KV error ≈ 0.027 vs nvfp4 ≈ 0.095)
+- **Deep-context speculative decode** — speculation stays *on* and *fast* across the full 500K window: a 3D split-KV kernel for the `q_len=8` verify shape plus a fix for the 262 144-token RoPE cliff take deep decode from ~4 to **~28–35 tok/s @400K** (see [Deep-context decode](#deep-context-decode))
 - **CUDA graphs** tuned for the DFlash decode batch shape (capture sizes = multiples of 8)
 - **Cross-node tensor parallelism (TP=2)** over Ray, with a cluster-join race fix
 
@@ -21,7 +22,8 @@ MiMo-V2.5 (a ~309B-total MoE) has no official recipe for the GB10 / sm_121 platf
 naive vLLM paths (Flash-DiffKV, Triton-DiffKV) either crash or produce garbage on sm_121. This
 repo captures a working, tuned configuration: the base upstream vLLM image plus a small set of
 **mods** (runtime patches applied at container start) that make MiMo-V2.5 + DFlash + fp8-KV run
-correctly and fast on dual GB10.
+correctly and fast on dual GB10 — including at deep context, which is where the interesting
+engineering lives.
 
 ## Results (measured)
 
@@ -31,7 +33,7 @@ correctly and fast on dual GB10.
 | Long context | validated to **240K real tokens with correct needle recall**; `max_model_len=500000` |
 | Short-context decode | JSON ~48–52 / code ~44 tok/s |
 | Multi-stream (code, mns=8, cudagraph) | 1: 33 · 2: 52 (28 ea) · 4: 69 (20 ea) · 8: 111 tok/s aggregate (sub-linear — see below) |
-| **Deep decode, honest** (real prose, **real temperature**, thinking-off) | *baseline (spec collapsed at depth):* 100K: 12 · 200K: 10 · 300K: 5 · 400K: 4 tok/s. Prefill ≈ 0.8 s / 1K tokens (400K ≈ 5 min cold). **With the deep-context fixes (below): ~28–35 (structured) / ~14–18 (prose) tok/s @400K.** |
+| **Deep decode, honest** (real prose, **real temperature**, thinking-off) | *without the deep-context fixes (drafter collapses at depth):* 100K: 12 · 200K: 10 · 300K: 5 · 400K: 4 tok/s. **With the fixes ([Deep-context decode](#deep-context-decode)): ~28–35 (structured) / ~14–18 (prose) tok/s @400K.** Prefill ≈ 0.8 s / 1K tokens (400K ≈ 5 min cold). |
 | Tool-calling quality (tool-eval-bench) | 90 / ★★★★★ Excellent, 0 safety warnings |
 | Reliability (reliability-bench v1_full) | on par with the fp16/fp8 baseline (existence 24/24, refusal 9/9) |
 
@@ -39,11 +41,10 @@ correctly and fast on dual GB10.
 prompts *inflate* speculative-decoding accept-length and overstate tok/s — measure at your real
 serving temperature with real, non-repetitive content; (2) speculative decode streams **per step,
 not per token**, so count tokens via `usage.completion_tokens` (`stream=False`), never by counting
-SSE chunks. Under real conditions the DFlash speedup largely collapses on unpredictable prose, and
-deep-context decode is bounded by full-attention O(context) growth — 500K context is usable
-(works, recalls) but slow to decode at depth. Speculative decode is single-stream-latency
-optimized: the per-stream drafter cost does not amortize across concurrent requests, so aggregate
-throughput scales sub-linearly (good for "one big stream + a few side streams").
+SSE chunks. Deep-context decode is bounded by full-attention O(context) growth — 500K context is
+usable (works, recalls) but decodes slower at depth even with speculation on. Speculative decode is
+single-stream-latency optimized: the per-stream drafter cost does not amortize across concurrent
+requests, so aggregate throughput scales sub-linearly (good for "one big stream + a few side streams").
 
 ## Hardware
 
@@ -75,7 +76,7 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 - `nvfp4-draft-bf16` / `nvfp4-draft-blocksize` — force the DFlash drafter KV to bf16 / block-16 (anti-padding)
 - `ray-cvd-fallback` — Ray accelerator ordinal fallback (fixes a CUDA_VISIBLE_DEVICES crash under TP)
 - `omni-eagle3` — expose `SupportsEagle3` on `MiMoV2Omni` so the DFlash drafter can attach its EAGLE3 aux-hidden-state interface (upstream #46104 added it only to the non-Omni `MiMoV2Flash` class)
-- `diffkv-3d-qlen8` / `dflash-cliff-fix` — deep-context speculative-decode fixes (see **Deep-context speed** below)
+- `diffkv-3d-qlen8` / `dflash-cliff-fix` — keep speculation fast and alive at deep context (see [Deep-context decode](#deep-context-decode))
 
 **Model artifacts** (not in this repo — pull / quantize separately):
 - Target: **MiMo-V2.5** quantized `modelopt_mixed` (NVFP4 MoE + o_proj MXFP8), served from `MiMo-oproj-mxfp8`
@@ -85,6 +86,70 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 > The base image itself is not published (it's a large local CUDA build). To reproduce: build
 > upstream vLLM `main` @ ~3775d5fca for CUDA 13.2 / sm_121, then apply the `mods/` at container
 > start (each mod is a marker-guarded, idempotent `run.sh` that patches site-packages in place).
+
+## Deep-context decode
+
+Keeping speculative decoding useful *at depth* — not just at short context — took two fixes.
+Both ship in the mods above and are **enabled by default**; together they take deep single-stream
+decode at 400K from ~4 tok/s (drafter effectively off) to **~28–35 tok/s** on structured content.
+This is the part that isn't obvious from a stock config, so it's documented in full.
+
+### 3D split-KV for the DFlash verify shape (`diffkv-3d-qlen8`)
+
+DFlash's verify shape is `q_len = 8`, but the DiffKV Triton launcher gated its 3D
+split-KV / FlashDecoding path behind `max_seqlen_q > 1` — so the 8-wide verify fell back to a
+**2D kernel running ~16 CTAs on the 48-SM GPU (~6–7 % of memory bandwidth)**. Admitting
+`q_len ≤ 8` into the 3D path (env `VLLM_DIFFKV_3D_Q8=1`) launches ~256 CTAs instead:
+
+- **deep-spec decode +85 % @ 400K** (3.9 → 7.2 tok/s), memory-neutral, numerically identical
+  (needle-in-haystack @125K verified, no sm_121 miscompile at 64+ softmax segments).
+
+### Speculation past 262 144 tokens (`dflash-cliff-fix` + a drafter config bump)
+
+The DFlash drafter's RoPE `cos_sin_cache` is sized from its `max_position_embeddings` (`262144`),
+and vLLM's `_input_fits_in_drafter` guard silently **disables speculation above 262 136 tokens**
+to avoid an out-of-bounds RoPE gather — so at 300K–500K the drafter was off (`accept_len = 1.0`)
+and deep decode crawled. The fix has three parts:
+
+1. Bump the drafter's `config.json` → `"max_position_embeddings": 524288` (both nodes).
+2. `dflash-cliff-fix` (env `VLLM_DFLASH_MAXPOS=1`) extends the RoPE table to the target
+   `max_model_len` and adds a **saturating** position clamp as an OOB belt (never EAGLE-style
+   clamp-to-zero — that corrupts the relative RoPE offset).
+3. **Wipe the torch-compile cache once** as root (`sudo rm -rf ~/.cache/vllm/torch_compile_cache`
+   on both nodes) so the drafter recompiles with the extended RoPE. The cache is keyed on config
+   and lives on a host bind-mount that **survives container recreation** — otherwise a stale hit
+   serves the old 262144-bound Inductor kernel and the fix silently no-ops (verify the fresh
+   `…/eagle_head/computation_graph.py` shows `cos_sin_cache: bf16[524288, 64]` before traffic).
+
+Acceptance at 400K then goes **1.0 → ~3.8** on structured content (JSON/code) → **deep-spec decode
+~4× (≈7 → ~28–35 tok/s @400K)**, quality-neutral: speculation is lossless — the target verifies
+every token, and the config only changes *where* the drafter engages, not the output. The drafter's
+sliding-window-1024 attention keeps acceptance healthy at any absolute depth (relative RoPE offsets
+stay in-distribution).
+
+### What doesn't help — and why
+
+- **KV-sparsity (Quest)** and **acceptance-adaptive `num_speculative_tokens`** both change the
+  decode `q_len`/shape at runtime → the batch misses the captured CUDA graph → attention falls back
+  to eager, which *negates* the saving exactly at deep context where it's needed. Only changes that
+  **respect the captured shape** (the two above) or are **orthogonal** to it pay off.
+- **MoE-backend autotune** is neutral — deep decode is weight-bandwidth-bound, not MoE-GEMM-bound.
+
+### The ceiling, and what's next
+
+Deep single-stream @400K is bounded by a ~34–38 ms/step MoE weight-streaming floor plus the KV
+read. Realistic deep decode is **~28–35 tok/s (structured) / ~14–18 (prose)** — not 40+. The
+attention kernel itself reads at only ~21 % of the 273 GB/s LPDDR bandwidth (parallelism-starved at
+`q_len=1`), but widening it helps only the no-spec path.
+
+The next real lever is **decode context-parallelism** — splitting the KV sequence across both GB10
+nodes for a projected **~1.5–1.8×** at depth. A first implementation is **drafted** in
+`mods/dcp-diffkv`, env-gated behind `VLLM_DCP` + `VLLM_DCP_STAGE2_OK` and **off by default** (it
+never runs in the prod recipe): the per-token LSE expose from the DiffKV reduce, the exact
+LSE-weighted cross-rank combine, and the metadata seq-len split are in place. The context/query
+`seqused_k` split and numeric parity are **marked placeholders pending a live single-boot
+validation** — it is *not yet enabled or benchmarked*, so treat the ~1.5–1.8× as a target, not a
+measured result.
 
 ## Repository layout
 
@@ -102,7 +167,7 @@ mods/                        # runtime patches, applied in recipe order at conta
   ray-cvd-fallback/          # Ray accelerator ordinal fallback (fixes a CVD crash under TP)
   omni-eagle3/               # add SupportsEagle3 to MiMoV2Omni (DFlash EAGLE3 aux interface)
   mimo-chat-template/        # writes the MiMo chat template (bounded reasoning) into the container
-  dcp-diffkv/                # EXPERIMENTAL (off by default) — decode context-parallelism draft; see "Honest ceiling"
+  dcp-diffkv/                # EXPERIMENTAL (off by default) — decode context-parallelism draft; see "Deep-context decode"
 systemd/
   mimo-fp8kv-prod.service    # persistent daily-driver unit (auto-boot, crash-restart, memory cleanup)
   mimo-fp8kv-pre-start.sh    # pre-start cleanup: stop containers + UVM reset + drop_caches (both nodes)
@@ -114,6 +179,7 @@ systemd/
 |---|---|---|
 | `--kv-cache-dtype fp8` + `VLLM_FP8_INLINE=1` | fp8 e4m3, in-kernel descale | 5.8× KV pool; dequant = bitcast+multiply (3.5–4.8× faster than nvfp4 unpack+LUT) |
 | `--speculative-config … method=dflash, num_speculative_tokens=7` | DFlash drafter | ~2× single-stream |
+| `VLLM_DIFFKV_3D_Q8=1` + `VLLM_DFLASH_MAXPOS=1` (+ drafter `max_position_embeddings=524288`) | deep-context spec | keeps speculation on and fast past 262K (see [Deep-context decode](#deep-context-decode)) |
 | `--compilation-config cudagraph_capture_sizes=[1,2,4,8,16,24,32,48,64]` | CUDA graphs | multiples of 8 = DFlash decode batch (num_seqs × (num_spec+1)); +5–8% at concurrency |
 | `gpu_memory_utilization: 0.86` | hard ceiling on GB10 | 0.87/0.88 freeze the node (unified-memory startup guard) |
 | `max_num_seqs: 8` | concurrency cap | "1 big + a few side streams" |
@@ -158,64 +224,3 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 
 Configuration and mods: MIT. The model weights are governed by their own license (see the
 MiMo-V2.5 model card).
-
-## Deep-context speed (update 2026-07)
-
-Two fixes make **speculative decoding work — and stay fast — at deep context**, across the full 500K window.
-
-### 1. 3D split-KV for the DFlash verify shape (`mods/diffkv-3d-qlen8`)
-
-DFlash's verify shape is `q_len = 8`, but the DiffKV Triton launcher gated the 3D
-split-KV / FlashDecoding path behind `max_seqlen_q > 1` — so the 8-wide verify fell
-back to a **2D kernel running ~16 CTAs on the 48-SM GPU (~6–7 % of memory bandwidth)**.
-Relaxing the gate to admit `q_len ≤ 8` into the 3D path (env `VLLM_DIFFKV_3D_Q8=1`)
-launches ~256 CTAs instead:
-
-- **deep-spec decode +85 % @ 400K** (3.9 → 7.2 tok/s), memory-neutral, numerically
-  identical (needle-in-haystack @125K verified, no sm_121 miscompile at 64/… segments).
-
-### 2. Speculation past 262 144 tokens (`mods/dflash-cliff-fix` + drafter config bump)
-
-The DFlash drafter's RoPE `cos_sin_cache` is sized from its `max_position_embeddings`
-(`262144`). vLLM's `_input_fits_in_drafter` guard silently **disables speculation above
-262 136 tokens** to avoid an out-of-bounds RoPE gather — so at 300K–500K the drafter was
-off (`accept_len = 1.0`) and deep decode crawled. The fix, three parts:
-
-1. Bump the drafter's `config.json` → `"max_position_embeddings": 524288` (both nodes).
-2. `mods/dflash-cliff-fix` (env `VLLM_DFLASH_MAXPOS=1`) extends the RoPE table to the
-   target `max_model_len` and adds a **saturating** position clamp as an OOB belt
-   (never EAGLE-style clamp-to-zero — that corrupts the relative RoPE offset).
-3. **Wipe the torch-compile cache once** as root
-   (`sudo rm -rf ~/.cache/vllm/torch_compile_cache` on both nodes) so the drafter
-   recompiles with the extended RoPE. The cache is keyed on config and lives on a host
-   bind-mount that **survives container recreation** — otherwise a stale hit serves the
-   old 262144-bound Inductor kernel and the fix silently no-ops (verify the fresh
-   `…/eagle_head/computation_graph.py` shows `cos_sin_cache: bf16[524288, 64]` before traffic).
-
-Result: acceptance at 400K goes **1.0 → ~3.8** on structured content (JSON/code) →
-**deep-spec decode ~4× (≈7 → ~28–35 tok/s @400K)**, quality-neutral (speculation is
-lossless — the target verifies every token; the config only changes *where* the drafter
-engages, not the output). The drafter's sliding-window-1024 attention keeps acceptance
-healthy at any absolute depth (relative RoPE offsets stay in-distribution).
-
-### What didn't work (for the record)
-
-- **KV-sparsity (Quest)** and **acceptance-adaptive `num_speculative_tokens`**: both change
-  the decode `q_len`/shape at runtime → the batch misses the captured CUDA graph → attention
-  falls to eager, which *negates* the saving exactly at deep context where it's needed. Only
-  changes that **respect the captured shape** (the two above) or are **orthogonal** to it pay off.
-- **MoE-backend autotune**: neutral — deep decode is weight-bandwidth-bound, not MoE-GEMM-bound.
-
-### Honest ceiling
-
-Deep single-stream @400K is bounded by a ~34–38 ms/step MoE weight-streaming floor plus the
-KV read. Realistic deep decode is **~28–35 tok/s (structured) / ~14–18 (prose)** — not 40+.
-The attention kernel itself reads at only ~21 % of the 273 GB/s LPDDR bandwidth (parallelism-
-starved at `q_len=1`), but widening it helps only the no-spec path. The next real lever is
-**decode context-parallelism** (split the KV sequence across both GB10 nodes for ~1.5–1.8×
-deep). A first implementation is **drafted** in `mods/dcp-diffkv` (env-gated behind
-`VLLM_DCP` + `VLLM_DCP_STAGE2_OK`, off by default, so it never runs in the prod recipe):
-the per-token LSE expose from the DiffKV reduce, the exact LSE-weighted cross-rank combine,
-and the metadata seq-len split are in place. The context/query `seqused_k` split and numeric
-parity are **marked placeholders pending a live single-boot validation** — it is *not yet
-enabled or benchmarked*, so treat the ~1.5–1.8× as a target, not a measured result.
