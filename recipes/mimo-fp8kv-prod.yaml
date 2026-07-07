@@ -26,6 +26,8 @@ mods:
   - mods/nvfp4-draft-bf16
   - mods/nvfp4-draft-blocksize
   - mods/fp8-kv-inline
+  - mods/diffkv-3d-qlen8
+  - mods/dflash-cliff-fix
   - mods/ray-cvd-fallback
   - mods/omni-eagle3
   - mods/mimo-chat-template
@@ -85,6 +87,11 @@ env:
   # (calculate_kv_scales False). Set to "0" to A/B back to the bf16-dequant
   # SCRATCH fallback.
   VLLM_FP8_INLINE: "1"
+  # #2 3D-split-KV FlashDecoding for the DFlash q_len=8 verify shape
+  # (validated: deep-spec +85% @400K / +31% @200K, needle@125K PASS, memory-neutral).
+  VLLM_DIFFKV_3D_Q8: "1"
+  # cliff-fix: spec >262K unlocked (drafter max_position 524288 + RoPE-extend + clamp belt)
+  VLLM_DFLASH_MAXPOS: "1"
   # NOTE: the dev114 MoE-FP4 env trio (VLLM_NVFP4_GEMM_BACKEND,
   # VLLM_USE_FLASHINFER_MOE_FP4, VLLM_FLASHINFER_MOE_BACKEND) was REMOVED from
   # this image's envs.py (refactored away on main; no code references them).
