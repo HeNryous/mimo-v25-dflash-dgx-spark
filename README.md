@@ -31,7 +31,7 @@ correctly and fast on dual GB10.
 | Long context | validated to **240K real tokens with correct needle recall**; `max_model_len=500000` |
 | Short-context decode | JSON ~48–52 / code ~44 tok/s |
 | Multi-stream (code, mns=8, cudagraph) | 1: 33 · 2: 52 (28 ea) · 4: 69 (20 ea) · 8: 111 tok/s aggregate (sub-linear — see below) |
-| **Deep decode, honest** (real prose, **real temperature**, thinking-off) | 100K: 12 · 200K: 10 · 300K: 5 · 400K: 4 tok/s. Prefill ≈ 0.8 s / 1K tokens (400K ≈ 5 min cold). |
+| **Deep decode, honest** (real prose, **real temperature**, thinking-off) | *baseline (spec collapsed at depth):* 100K: 12 · 200K: 10 · 300K: 5 · 400K: 4 tok/s. Prefill ≈ 0.8 s / 1K tokens (400K ≈ 5 min cold). **With the deep-context fixes (below): ~28–35 (structured) / ~14–18 (prose) tok/s @400K.** |
 | Tool-calling quality (tool-eval-bench) | 90 / ★★★★★ Excellent, 0 safety warnings |
 | Reliability (reliability-bench v1_full) | on par with the fp16/fp8 baseline (existence 24/24, refusal 9/9) |
 
@@ -74,6 +74,8 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 - `mimo-chat-template` — MiMo chat template (bounded reasoning) + reasoning parser
 - `nvfp4-draft-bf16` / `nvfp4-draft-blocksize` — force the DFlash drafter KV to bf16 / block-16 (anti-padding)
 - `ray-cvd-fallback` — Ray accelerator ordinal fallback (fixes a CUDA_VISIBLE_DEVICES crash under TP)
+- `omni-eagle3` — expose `SupportsEagle3` on `MiMoV2Omni` so the DFlash drafter can attach its EAGLE3 aux-hidden-state interface (upstream #46104 added it only to the non-Omni `MiMoV2Flash` class)
+- `diffkv-3d-qlen8` / `dflash-cliff-fix` — deep-context speculative-decode fixes (see **Deep-context speed** below)
 
 **Model artifacts** (not in this repo — pull / quantize separately):
 - Target: **MiMo-V2.5** quantized `modelopt_mixed` (NVFP4 MoE + o_proj MXFP8), served from `MiMo-oproj-mxfp8`
@@ -89,19 +91,21 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 ```
 recipes/
   mimo-fp8kv-prod.yaml       # the production recipe (cudagraph, mns=8, fp8-KV, DFlash)
-mods/
+mods/                        # runtime patches, applied in recipe order at container start
+  drop-caches/               # page-cache drop before launch
   fix-mimo-v2-upstream/      # MiMo-V2.5 support for the upstream vLLM image (config reg, DiffKV fp8, audio deps)
-  fp8-kv-inline/             # in-kernel fp8 KV descale fast-path (bitcast + multiply)
   nvfp4-draft-bf16/          # force the DFlash drafter's KV to bf16
   nvfp4-draft-blocksize/     # drafter block_size 32->16 (reduce uniform-page padding)
+  fp8-kv-inline/             # in-kernel fp8 KV descale fast-path (bitcast + multiply)
+  diffkv-3d-qlen8/           # 3D split-KV for the DFlash q_len=8 verify shape (+85% deep-spec @400K)
+  dflash-cliff-fix/          # unlock speculation past 262K tokens (extend drafter RoPE to max_model_len)
   ray-cvd-fallback/          # Ray accelerator ordinal fallback (fixes a CVD crash under TP)
+  omni-eagle3/               # add SupportsEagle3 to MiMoV2Omni (DFlash EAGLE3 aux interface)
   mimo-chat-template/        # writes the MiMo chat template (bounded reasoning) into the container
-  drop-caches/               # page-cache drop before launch
+  dcp-diffkv/                # EXPERIMENTAL (off by default) — decode context-parallelism draft; see "Honest ceiling"
 systemd/
   mimo-fp8kv-prod.service    # persistent daily-driver unit (auto-boot, crash-restart, memory cleanup)
   mimo-fp8kv-pre-start.sh    # pre-start cleanup: stop containers + UVM reset + drop_caches (both nodes)
-docs/
-  DESIGN.md                  # the engineering notes (why each mod exists)
 ```
 
 ## Key configuration knobs
@@ -209,4 +213,9 @@ KV read. Realistic deep decode is **~28–35 tok/s (structured) / ~14–18 (pros
 The attention kernel itself reads at only ~21 % of the 273 GB/s LPDDR bandwidth (parallelism-
 starved at `q_len=1`), but widening it helps only the no-spec path. The next real lever is
 **decode context-parallelism** (split the KV sequence across both GB10 nodes for ~1.5–1.8×
-deep) — assessed feasible on this DiffKV stack, but a separate build.
+deep). A first implementation is **drafted** in `mods/dcp-diffkv` (env-gated behind
+`VLLM_DCP` + `VLLM_DCP_STAGE2_OK`, off by default, so it never runs in the prod recipe):
+the per-token LSE expose from the DiffKV reduce, the exact LSE-weighted cross-rank combine,
+and the metadata seq-len split are in place. The context/query `seqused_k` split and numeric
+parity are **marked placeholders pending a live single-boot validation** — it is *not yet
+enabled or benchmarked*, so treat the ~1.5–1.8× as a target, not a measured result.
