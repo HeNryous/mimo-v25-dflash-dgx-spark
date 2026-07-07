@@ -78,9 +78,18 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 - `omni-eagle3` — expose `SupportsEagle3` on `MiMoV2Omni` so the DFlash drafter can attach its EAGLE3 aux-hidden-state interface (upstream #46104 added it only to the non-Omni `MiMoV2Flash` class)
 - `diffkv-3d-qlen8` / `dflash-cliff-fix` — keep speculation fast and alive at deep context (see [Deep-context decode](#deep-context-decode))
 
-**Model artifacts** (not in this repo — pull / quantize separately):
-- Target: **MiMo-V2.5** quantized `modelopt_mixed` (NVFP4 MoE + o_proj MXFP8), served from `MiMo-oproj-mxfp8`
-- Drafter: **DFlash** (5-layer Qwen3, non-causal, sliding-window 1024), `num_speculative_tokens=7`
+**Model & quantization** (weights not in this repo — pull / build separately):
+
+- **Target — MiMo-V2.5**, NVIDIA **ModelOpt `MIXED_PRECISION`**. Built from
+  [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) plus a local
+  `o_proj` / `lm_head` requant overlay (`model-oproj-lmhead-requant.safetensors`); we serve it
+  from a directory labelled `MiMo-oproj-mxfp8`. Per-layer scheme (from `hf_quant_config.json`):
+  - **NVFP4** (NVIDIA 4-bit float, 16-value micro-blocks) — MoE experts + most linear projections; the bulk of the ~309B weights
+  - **MXFP8** (8-bit microscaling) — attention output `o_proj` in every layer, via the local requant; buys ~8.5% KV headroom / a little quality at **no decode-speed cost**
+  - **bf16, un-quantized** (`exclude_modules`) — `lm_head`, `embed_tokens`, final `norm`, RoPE tables, the vision + audio/speech encoders, and the first layers' MoE `gate` / `shared_expert`
+  - ~86.9 GiB/rank on GPU
+- **Drafter — DFlash** (5-layer Qwen3, non-causal, sliding-window 1024), `num_speculative_tokens=7`
+- **KV cache** is quantized separately at runtime to **fp8-e4m3** — a decode-time *cache* format, independent of the weight quantization above (see the knobs table)
 - Served under two aliases: `MiMo-V2.5-NVFP4` and `mimo-dflash-test`
 
 > The base image itself is not published (it's a large local CUDA build). To reproduce: build
@@ -217,6 +226,7 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 ## Credits
 
 - [Xiaomi MiMo-V2.5](https://huggingface.co/XiaomiMiMo) — the base model
+- [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) — the ModelOpt NVFP4 base quantization
 - [vLLM](https://github.com/vllm-project/vllm) — the serving engine
 - DFlash speculative decoding
 
