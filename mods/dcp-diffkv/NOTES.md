@@ -1,3 +1,9 @@
+> **CONFIG-BLOCKED on 2x GB10 (any TP <= 2x num_kv_heads).** vLLM rejects DCP for non-MLA attention
+> unless tensor_parallel_size > total_num_kv_heads AND dcp_size <= tp // num_kv_heads
+> (vllm/config/model.py). MiMo has 4 full-attn KV heads => dcp=2 needs TP>=8 GPUs. Verified July 2026:
+> pydantic ValidationError at config validation, before weight load. REFERENCE ONLY (MQA 1-KV-head or
+> >=8-GPU deployments). The logger-before-defined import bug is fixed.
+
 # dcp-diffkv — engineering notes (stage 2 drafted, disk-only)
 
 > 2026-07-07: `_forward_with_dcp` + the builder context-phase scratch are now

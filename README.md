@@ -154,14 +154,23 @@ read. Realistic deep decode is **~28–35 tok/s (structured) / ~14–18 (prose)*
 attention kernel itself reads at only ~21 % of the 273 GB/s LPDDR bandwidth (parallelism-starved at
 `q_len=1`), but widening it helps only the no-spec path.
 
-The next real lever is **decode context-parallelism** — splitting the KV sequence across both GB10
-nodes for a projected **~1.5–1.8×** at depth. A first implementation is **drafted** in
-`mods/dcp-diffkv`, env-gated behind `VLLM_DCP` + `VLLM_DCP_STAGE2_OK` and **off by default** (it
-never runs in the prod recipe): the per-token LSE expose from the DiffKV reduce, the exact
-LSE-weighted cross-rank combine, and the metadata seq-len split are in place. The context/query
-`seqused_k` split and numeric parity are **marked placeholders pending a live single-boot
-validation** — it is *not yet enabled or benchmarked*, so treat the ~1.5–1.8× as a target, not a
-measured result.
+A tempting next lever is **decode context-parallelism** (DCP) — splitting the KV sequence across
+both GB10 nodes for a projected ~1.5–1.8× at depth. **It does not work on this configuration, and
+the reason is architectural, not a tuning gap.** vLLM gates DCP for non-MLA (GQA/MQA) attention
+behind `tensor_parallel_size > total_num_kv_heads` **and** `dcp_size ≤ tensor_parallel_size //
+num_kv_heads` (`vllm/config/model.py`). MiMo-V2.5 has **4 full-attention KV heads**, so `dcp_size = 2`
+requires `tensor_parallel_size ≥ 8` — i.e. **8 GPUs**. On 2× GB10 (TP=2) the config validator
+rejects DCP at startup (a pydantic `ValidationError`, before weights even load). No flag or mod
+bypasses it; only MLA models (a single latent KV head, e.g. DeepSeek) sidestep the constraint,
+because non-MLA DCP works by *replicating* KV heads across the spare ranks above `num_kv_heads` —
+ranks that simply don't exist at TP=2 with 4 KV heads.
+
+A drafted DiffKV DCP implementation lives in `mods/dcp-diffkv` (env-gated, off by default) and is
+kept only as a **reference**: the per-token LSE expose from the DiffKV reduce, the exact
+LSE-weighted cross-rank combine, and the metadata seq-len split are in place; the context/query
+attention decomposition is unfinished. It could only ever benefit a **MQA DiffKV model (1 KV head)
+or an ≥8-GPU deployment** — never MiMo on two Sparks. Verified empirically (July 2026) at the
+cheapest possible gate: config validation, seconds into boot.
 
 ## Repository layout
 
@@ -179,7 +188,7 @@ mods/                        # runtime patches, applied in recipe order at conta
   ray-cvd-fallback/          # Ray accelerator ordinal fallback (fixes a CVD crash under TP)
   omni-eagle3/               # add SupportsEagle3 to MiMoV2Omni (DFlash EAGLE3 aux interface)
   mimo-chat-template/        # writes the MiMo chat template (bounded reasoning) into the container
-  dcp-diffkv/                # EXPERIMENTAL (off by default) — decode context-parallelism draft; see "Deep-context decode"
+  dcp-diffkv/                # REFERENCE ONLY — DCP draft; config-blocked on 2 GPUs (non-MLA DCP needs TP>=8 for 4 KV heads)
 systemd/
   mimo-fp8kv-prod.service    # persistent daily-driver unit (auto-boot, crash-restart, memory cleanup)
   mimo-fp8kv-pre-start.sh    # pre-start cleanup: stop containers + UVM reset + drop_caches (both nodes)

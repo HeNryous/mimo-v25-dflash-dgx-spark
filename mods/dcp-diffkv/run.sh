@@ -428,8 +428,6 @@ imp_new = imp_anchor + (
     "# recipe ALSO needs --decode-context-parallel-size >1 for the DCP group to\n"
     "# exist. Both required (belt-and-suspenders): unset/0 => stock, no dispatch.\n"
     "_VLLM_DCP = _os_dcp.environ.get(\"VLLM_DCP\", \"0\") == \"1\"\n"
-    "logger.info(\"[dcp-diffkv] DCP dispatch %s (VLLM_DCP=%s)\",\n"
-    "            \"ARMED\" if _VLLM_DCP else \"disabled\", _os_dcp.environ.get(\"VLLM_DCP\"))\n"
 )
 src = src.replace(imp_anchor, imp_new, 1)
 
