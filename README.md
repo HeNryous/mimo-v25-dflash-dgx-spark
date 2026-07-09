@@ -78,12 +78,14 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 - `omni-eagle3` — expose `SupportsEagle3` on `MiMoV2Omni` so the DFlash drafter can attach its EAGLE3 aux-hidden-state interface (upstream #46104 added it only to the non-Omni `MiMoV2Flash` class)
 - `diffkv-3d-qlen8` / `dflash-cliff-fix` — keep speculation fast and alive at deep context (see [Deep-context decode](#deep-context-decode))
 
-**Model & quantization** (weights not in this repo — pull / build separately):
+**Model & quantization** (base weights from Hugging Face; our small requant overlay is a [GitHub release](https://github.com/HeNryous/mimo-v25-dflash-dgx-spark/releases/tag/prod-overlay-v1)):
 
 - **Target — MiMo-V2.5**, NVIDIA **ModelOpt `MIXED_PRECISION`**. Built from
-  [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) plus a local
-  `o_proj` / `lm_head` requant overlay (`model-oproj-lmhead-requant.safetensors`); we serve it
-  from a directory labelled `MiMo-oproj-mxfp8`. Per-layer scheme (from `hf_quant_config.json`):
+  [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) plus our
+  `o_proj` requant overlay (`model-oproj-lmhead-requant.safetensors`), published as the
+  [`prod-overlay-v1`](https://github.com/HeNryous/mimo-v25-dflash-dgx-spark/releases/tag/prod-overlay-v1)
+  release — drop its 4 files into the base checkout to reproduce the **exact** checkpoint we serve
+  (a directory labelled `MiMo-oproj-mxfp8`). Per-layer scheme (from `hf_quant_config.json`):
   - **NVFP4** (NVIDIA 4-bit float, 16-value micro-blocks) — MoE experts + most linear projections; the bulk of the ~309B weights
   - **MXFP8** (8-bit microscaling) — attention output `o_proj` in every layer, via the local requant; buys ~8.5% KV headroom / a little quality at **no decode-speed cost**
   - **bf16, un-quantized** (`exclude_modules`) — `lm_head`, `embed_tokens`, final `norm`, RoPE tables, the vision + audio/speech encoders, and the first layers' MoE `gate` / `shared_expert`
@@ -222,9 +224,12 @@ systemd/
 # 1) Pull the pre-built vLLM image (no local build needed):
 docker pull ghcr.io/henryous/mimo-v25-dflash-dgx-spark:latest
 
-# 2) Fetch the model weights from Hugging Face (see "Model & quantization"):
-#    NVFP4 base ~171 GB -> huggingface.co/lukealonso/MiMo-V2.5-NVFP4
-#    (plus the DFlash drafter + o_proj/lm_head requant the recipe expects)
+# 2) Assemble the exact prod checkpoint (see "Model & quantization"):
+#    a) base ~171 GB:  hf download lukealonso/MiMo-V2.5-NVFP4 --local-dir MiMo-oproj-mxfp8
+#    b) our o_proj-MXFP8 overlay (4 files, ~1.7 GB) INTO that same dir
+#       (overwrites the 3 JSONs, adds the requant shard):
+#       gh release download prod-overlay-v1 -R HeNryous/mimo-v25-dflash-dgx-spark -D MiMo-oproj-mxfp8
+#    c) DFlash drafter -> XiaomiMiMo/MiMo-V2.5-DFlash (dflash/ subdir) into mimo-dflash/dflash/
 
 # 3) Launch — the recipe applies the mods/ at container start:
 # Head node (rank 0):
