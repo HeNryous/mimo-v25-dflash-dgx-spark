@@ -92,9 +92,12 @@ registry; DFlash aux+1 / SWA window symmetrization (#40727).
 - **KV cache** is quantized separately at runtime to **fp8-e4m3** — a decode-time *cache* format, independent of the weight quantization above (see the knobs table)
 - Served under two aliases: `MiMo-V2.5-NVFP4` and `mimo-dflash-test`
 
-> The base image itself is not published (it's a large local CUDA build). To reproduce: build
-> upstream vLLM `main` @ ~3775d5fca for CUDA 13.2 / sm_121, then apply the `mods/` at container
-> start (each mod is a marker-guarded, idempotent `run.sh` that patches site-packages in place).
+> **The pre-built image is published — pull it instead of building:**
+> `docker pull ghcr.io/henryous/mimo-v25-dflash-dgx-spark:latest`
+> (linux/arm64, CUDA 13.2, sm_121a, ~19.4 GB). The `mods/` are still applied at container start by
+> the recipe, and the model weights are pulled from Hugging Face separately (see above). To rebuild
+> from scratch instead: build upstream vLLM `main` @ ~3775d5fca for CUDA 13.2 / sm_121, then apply
+> the `mods/` (each is a marker-guarded, idempotent `run.sh` that patches site-packages in place).
 
 ## Deep-context decode
 
@@ -207,6 +210,14 @@ systemd/
 ## Quick start
 
 ```bash
+# 1) Pull the pre-built vLLM image (no local build needed):
+docker pull ghcr.io/henryous/mimo-v25-dflash-dgx-spark:latest
+
+# 2) Fetch the model weights from Hugging Face (see "Model & quantization"):
+#    NVFP4 base ~171 GB -> huggingface.co/lukealonso/MiMo-V2.5-NVFP4
+#    (plus the DFlash drafter + o_proj/lm_head requant the recipe expects)
+
+# 3) Launch — the recipe applies the mods/ at container start:
 # Head node (rank 0):
 ./run-recipe.sh -d recipes/mimo-fp8kv-prod.yaml
 
