@@ -1,8 +1,12 @@
-> **CONFIG-BLOCKED on 2x GB10 (any TP <= 2x num_kv_heads).** vLLM rejects DCP for non-MLA attention
-> unless tensor_parallel_size > total_num_kv_heads AND dcp_size <= tp // num_kv_heads
-> (vllm/config/model.py). MiMo has 4 full-attn KV heads => dcp=2 needs TP>=8 GPUs. Verified July 2026:
-> pydantic ValidationError at config validation, before weight load. REFERENCE ONLY (MQA 1-KV-head or
-> >=8-GPU deployments). The logger-before-defined import bug is fixed.
+> **ABANDONED (2026-07-09) — do not use.** A follow-up mathematical audit showed this is not merely
+> config-blocked but *fundamentally* dead for MiMo-class models at TP <= num_kv_heads: the vLLM gate
+> (tensor_parallel_size > total_num_kv_heads, vllm/config/model.py) encodes a **correctness** requirement,
+> not a performance guard. With 4 full-attn KV heads at TP=2, plain TP already stores zero redundant KV —
+> there are no replicas for DCP to deduplicate, so the theoretical pool/bandwidth gain is exactly zero,
+> and the drafted `_forward_with_dcp` below is **numerically invalid** (KV-head identity across ranks was
+> never handled). An earlier feasibility estimate of "1.5-1.8x" was refuted (it double-counted bytes that
+> are context, not redundancy). Kept only as an engineering-history artifact. If you run MLA models
+> (replicated-KV, e.g. DeepSeek-class) see upstream PR #44573 instead — that is the real DCP path.
 
 # dcp-diffkv — engineering notes (stage 2 drafted, disk-only)
 
