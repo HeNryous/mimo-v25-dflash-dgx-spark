@@ -16,6 +16,19 @@ capable and exposes an OpenAI-compatible API.
 > **Status:** production. Serves an OpenAI-compatible endpoint; wired as the backend for an
 > agentic harness (tool-calling + reasoning).
 
+## Sampling recommendation for tool-calling (measured 2026-07-10)
+
+9-run sweep of tool-eval-bench (69 scenarios, same engine/config, sequential) on the prod config:
+
+| arm | runs | mean |
+|---|---|---|
+| **temperature 0.0 (recommended)** | 88 / 86 / 88 | **87.3** |
+| temp 0.3, top_p 0.95 | 87 / 91 | 89.0 |
+| temp 0.7, top_p 0.95 | 85 / 91 | 88.0 |
+| temp 1.0, top_p 0.95 (model generation_config default) | 86 / 84 | **85.0** |
+
+Takeaways: (1) run-to-run noise is **±2 points even at greedy** (speculative-decode + batching nondeterminism) — single-run tool-bench comparisons below ~4 points are noise; (2) no temperature arm beats baseline+noise, and temperature mainly inflates variance; (3) the model card default (temp 1.0 / top_p 0.95) is consistently the **worst** arm for tool-calling. We serve greedy for agentic/tool use. Sweep runner: `benchmarks/sampling_sweep.sh`.
+
 ## 2026-07-10 performance update (all shipped in recipes/mimo-fp8kv-prod.yaml)
 
 Three additive, quality-neutral improvements, each independently A/B-measured on 2x GB10:
