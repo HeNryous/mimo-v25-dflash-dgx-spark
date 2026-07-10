@@ -16,6 +16,16 @@ capable and exposes an OpenAI-compatible API.
 > **Status:** production. Serves an OpenAI-compatible endpoint; wired as the backend for an
 > agentic harness (tool-calling + reasoning).
 
+## 2026-07-10 performance update (all shipped in recipes/mimo-fp8kv-prod.yaml)
+
+Three additive, quality-neutral improvements, each independently A/B-measured on 2x GB10:
+
+1. **Prefill kernel tune — `mods/diffkv-prefill-tune`** (BLOCK_M=32, num_warps=4, num_stages=2, tile=32, prefill-only gate `max_seqlen_q > 8`): the stock DiffKV launch under-tiles prefill (BLOCK_Q=1 at nqpk=16). The tuned launch is **bit-identical** to stock (parity-verified on both nodes incl. SWA/mixed-batch/fp8-arm: rel-err 0.0, zero big-error elements) and cuts cold TTFT by **12.6% @50K / 23.3% @200K / 27.8% @400K** (measured: 27.2->23.8s, 234->179s, 804->580s). Default-ON when the mod is applied; set `VLLM_DIFFKV_PREFILL_TUNE=off` to force stock. Decode/spec/cudagraph paths untouched.
+2. **Prefill/decode fairness — `--long-prefill-token-threshold 2048`**: without it, a long prefill chunk fills the whole `max_num_batched_tokens` budget every step and concurrent decode streams freeze for the entire prefill (measured: a ~150K-token prefill stalled a parallel stream for **~120s**). With the cap, decodes co-schedule every step: worst-case inter-token gap drops to **~3.2s** (median ~1.7s) at a prefill-time cost of ~1.5%. Note: vLLM's auto-default for this flag (4% of max_model_len) is larger than mnbt and therefore inert — it must be set explicitly.
+3. **Deep-decode bandwidth — `mods/diffkv-kernel-bw` now default in the prod recipe** (`VLLM_DIFFKV_SEGMENTS` 16->64 in the 3D split-KV decode): +18% @200K / +5% @400K no-spec decode, needle-verified.
+
+Operational hardening (see `systemd/`): the pre-start now pauses neo4j during vLLM's startup memory profiling (the 0.86-util guard is razor-thin on GB10; any ~1-2 GiB co-resident service fails the boot) and kills known guard-margin eaters; an `ExecStartPost` re-triggers the dependent-services gate after every restart. Pool at util 0.86 / mml 500K with all services online: **~1.58M tokens (3.17x concurrency)**.
+
 ## Why this exists
 
 MiMo-V2.5 (a ~309B-total MoE) has no official recipe for the GB10 / sm_121 platform, and the

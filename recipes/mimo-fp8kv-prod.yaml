@@ -27,10 +27,12 @@ mods:
   - mods/nvfp4-draft-blocksize
   - mods/fp8-kv-inline
   - mods/diffkv-3d-qlen8
+  - mods/diffkv-kernel-bw
   - mods/dflash-cliff-fix
   - mods/ray-cvd-fallback
   - mods/omni-eagle3
   - mods/mimo-chat-template
+  - mods/diffkv-prefill-tune
 
 defaults:
   port: 8000
@@ -90,8 +92,10 @@ env:
   # #2 3D-split-KV FlashDecoding for the DFlash q_len=8 verify shape
   # (validated: deep-spec +85% @400K / +31% @200K, needle@125K PASS, memory-neutral).
   VLLM_DIFFKV_3D_Q8: "1"
+  VLLM_DIFFKV_BW: "1"
   # cliff-fix: spec >262K unlocked (drafter max_position 524288 + RoPE-extend + clamp belt)
   VLLM_DFLASH_MAXPOS: "1"
+  VLLM_DIFFKV_PREFILL_TUNE: "32,4,2,32"
   # NOTE: the dev114 MoE-FP4 env trio (VLLM_NVFP4_GEMM_BACKEND,
   # VLLM_USE_FLASHINFER_MOE_FP4, VLLM_FLASHINFER_MOE_BACKEND) was REMOVED from
   # this image's envs.py (refactored away on main; no code references them).
@@ -124,6 +128,7 @@ command: |
       --compilation-config '{{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,48,64]}}' \
       --enable-prefix-caching \
       --enable-chunked-prefill \
+      --long-prefill-token-threshold 2048 \
       --load-format auto \
       --enable-auto-tool-choice \
       --tool-call-parser mimo \

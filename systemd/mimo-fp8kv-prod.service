@@ -15,6 +15,8 @@ WorkingDirectory=/home/admin/spark-vllm-docker
 ExecStartPre=/usr/local/bin/mimo-fp8kv-pre-start.sh
 
 ExecStart=/home/admin/spark-vllm-docker/run-recipe.sh -d recipes/mimo-fp8kv-prod.yaml
+# restart the neo4j/hindsight gate (waits for vLLM health itself) after every service (re)start
+ExecStartPost=/usr/local/bin/mimo-fp8kv-post-start.sh
 
 ExecStop=-/usr/bin/docker stop vllm_node
 ExecStop=-/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=no 10.0.0.2 docker stop vllm_node
