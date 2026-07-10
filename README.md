@@ -30,6 +30,8 @@ capable and exposes an OpenAI-compatible API.
 
 Takeaways: (1) run-to-run noise is **±2 points even at greedy** (speculative-decode + batching nondeterminism) — single-run tool-bench comparisons below ~4 points are noise; (2) no temperature arm beats baseline+noise, and temperature mainly inflates variance; (3) the model card default (temp 1.0 / top_p 0.95) is consistently the **worst** arm for tool-calling. Thinking mode gains nothing on tool-calling either (+1.2, inside noise) while adding per-call latency. We serve greedy with thinking off for agentic/tool use. Sweep runner: `benchmarks/sampling_sweep.sh`.
 
+**Final quality gate (2026-07-10, on the exact shipped config):** reliability-bench v1_full **57/79 first-pass** (anchor 56/79 -- existence 23/24, refusal 9/9; the known xref/quant counting weakness unchanged), tool-eval 87.3 +/- 2 (11-run band), loop battery 0/12, needle@126K PASS. Pool 1,667,459 tokens / 3.33x @ mml 500K with all services co-resident.
+
 ## Measured dead ends (2026-07-10) -- so you don't repeat them
 
 - **safe-TILE64 prefill kernel**: TILE=64 loads with order-preserving 2x32 tl.split sub-tiling is provably **bit-identical** (parity rel 0.0 on all cases incl. SWA/mixed) but **0.82-0.87x SLOWER** -- permute/split register pressure eats the wide-load win. The raw joint-64 path is 1.45-1.56x faster but numerically reordered (rel-err 3-7e-3) -- rejected. Patcher + parity harness kept under `mods/diffkv-prefill-tune/` + `benchmarks/reference/`; the shipped default stays tile=32.
