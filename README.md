@@ -1,297 +1,161 @@
-# MiMo-V2.5-DFlash on 2× DGX Spark (GB10 / sm_121) — fp8-KV + Speculative Decoding
+# MiMo-V2.5-DFlash on 2× DGX Spark (GB10) — fp8-KV + Speculative Decoding
 
-An optimized [vLLM](https://github.com/vllm-project/vllm) serving recipe for running
-**Xiaomi [MiMo-V2.5](https://huggingface.co/XiaomiMiMo)** across **two NVIDIA DGX Spark
-(GB10, sm_121a)** nodes with:
+A production [vLLM](https://github.com/vllm-project/vllm) recipe for
+**Xiaomi [MiMo-V2.5](https://huggingface.co/XiaomiMiMo)** (~309B MoE) on **two NVIDIA DGX Spark
+(GB10, sm_121a)** nodes: DFlash speculative decoding, fp8 KV cache, tuned kernels, 500K context.
+This is the exact daily-driver configuration we serve — every number below was measured on it.
 
-- **DFlash speculative decoding** (5-layer Qwen3 drafter, `num_speculative_tokens=7`) — ~2× single-stream throughput
-- **fp8 (e4m3) KV cache** with an in-kernel descale fast-path — **~5.8× larger KV pool** than bf16, at negligible quality cost (KV error ≈ 0.027 vs nvfp4 ≈ 0.095)
-- **Deep-context speculative decode** — speculation stays *on* and *fast* across the full 500K window: a 3D split-KV kernel for the `q_len=8` verify shape plus a fix for the 262 144-token RoPE cliff take deep decode from ~4 to **~28–35 tok/s @400K** (see [Deep-context decode](#deep-context-decode))
-- **CUDA graphs** tuned for the DFlash decode batch shape (capture sizes = multiples of 8)
-- **Cross-node tensor parallelism (TP=2)** over Ray, with a cluster-join race fix
-
-This is the daily-driver configuration we run on a home 2× GB10 cluster. It is text+omni
-capable and exposes an OpenAI-compatible API.
-
-> **Status:** production. Serves an OpenAI-compatible endpoint; wired as the backend for an
-> agentic harness (tool-calling + reasoning).
-
-## Sampling recommendation for tool-calling (measured 2026-07-10)
-
-9-run sweep of tool-eval-bench (69 scenarios, same engine/config, sequential) on the prod config:
-
-| arm | runs | mean |
-|---|---|---|
-| **temperature 0.0 (recommended)** | 88 / 86 / 88 | **87.3** |
-| temp 0.3, top_p 0.95 | 87 / 91 | 89.0 |
-| temp 0.7, top_p 0.95 | 85 / 91 | 88.0 |
-| temp 1.0, top_p 0.95 (model generation_config default) | 86 / 84 | **85.0** |
-| temp 0.0 + thinking ON (`enable_thinking: true`) | 89 / 88 | 88.5 |
-
-Takeaways: (1) run-to-run noise is **±2 points even at greedy** (speculative-decode + batching nondeterminism) — single-run tool-bench comparisons below ~4 points are noise; (2) no temperature arm beats baseline+noise, and temperature mainly inflates variance; (3) the model card default (temp 1.0 / top_p 0.95) is consistently the **worst** arm for tool-calling. Thinking mode gains nothing on tool-calling either (+1.2, inside noise) while adding per-call latency. We serve greedy with thinking off for agentic/tool use. Sweep runner: `benchmarks/sampling_sweep.sh`.
-
-**Final quality gate (2026-07-10, on the exact shipped config):** reliability-bench v1_full **57/79 first-pass** (anchor 56/79 -- existence 23/24, refusal 9/9; the known xref/quant counting weakness unchanged), tool-eval 87.3 +/- 2 (11-run band), loop battery 0/12, needle@126K PASS. Pool 1,667,459 tokens / 3.33x @ mml 500K with all services co-resident.
-
-## Measured dead ends (2026-07-10) -- so you don't repeat them
-
-- **safe-TILE64 prefill kernel**: TILE=64 loads with order-preserving 2x32 tl.split sub-tiling is provably **bit-identical** (parity rel 0.0 on all cases incl. SWA/mixed) but **0.82-0.87x SLOWER** -- permute/split register pressure eats the wide-load win. The raw joint-64 path is 1.45-1.56x faster but numerically reordered (rel-err 3-7e-3) -- rejected. Patcher + parity harness kept under `mods/diffkv-prefill-tune/` + `benchmarks/reference/`; the shipped default stays tile=32.
-- **num_stages 3/4** on the tuned prefill launch: consistently <= stages=2 (measured twice, prod-identical kernel).
-- **Draft-model fp8** (`speculative_config quantization:"fp8"`): architecturally incompatible with DFlash's fused context-KV projection -- the drafter reads raw `.weight` tensors at init (qwen3_dflash.py:444/516) and fp8-packed layers yield a zero-width fused weight. Fix would require rewriting the fusion for quantized weights; parked at +3-4% expected gain.
-- **MoE prefill GEMM swap**: at the production chunk size the fused nvfp4 MoE kernel already runs at **83.5% of the memory roofline** (96% at chunk 512); autotune on/off is within 2-5%. No backend swap can pay here.
-- **Decoupled DFlash proposer** (KV-less custom_class): the drafter KV group costs only 3-6% of per-request pool in this vLLM's admission accounting -- the mechanism's prize doesn't exist here, and per-rank bf16 drafter replicas make the literal port net-negative.
-
-## 2026-07-10 performance update (all shipped in recipes/mimo-fp8kv-prod.yaml)
-
-Three additive, quality-neutral improvements, each independently A/B-measured on 2x GB10:
-
-1. **Prefill kernel tune — `mods/diffkv-prefill-tune`** (BLOCK_M=32, num_warps=4, num_stages=2, tile=32, prefill-only gate `max_seqlen_q > 8`): the stock DiffKV launch under-tiles prefill (BLOCK_Q=1 at nqpk=16). The tuned launch is **bit-identical** to stock (parity-verified on both nodes incl. SWA/mixed-batch/fp8-arm: rel-err 0.0, zero big-error elements) and cuts cold TTFT by **12.6% @50K / 23.3% @200K / 27.8% @400K** (measured: 27.2->23.8s, 234->179s, 804->580s). Default-ON when the mod is applied; set `VLLM_DIFFKV_PREFILL_TUNE=off` to force stock. Decode/spec/cudagraph paths untouched.
-2. **Prefill/decode fairness — `--long-prefill-token-threshold 4096`** (updated from 2048 after a chunk-size A/B): without it, a long prefill chunk fills the whole `max_num_batched_tokens` budget every step and concurrent decode streams freeze for the entire prefill (measured: a ~150K-token prefill stalled a parallel stream for **~120s**). With the cap, decodes co-schedule every step: worst-case inter-token gap drops to **~3.2s** (median ~1.7s) at a prefill-time cost of ~1.5%. Note: vLLM's auto-default for this flag (4% of max_model_len) is larger than mnbt and therefore inert — it must be set explicitly.
-   Chunk-size A/B (same engine, 150K prefill + parallel decode stream): threshold **4096** beats 2048 on every axis that matters -- prefill under contention 124.3s -> **89.4s (-28%)**, decode inter-token median during the prefill 1654ms -> **148ms (11x)**, worst-case gap 3.2s -> 4.2s (the one small regression), cold TTFT@200K ~-5%. Larger chunks mean fewer long scheduler steps; decodes run nearly freely between them. The MoE side explains it: the fused nvfp4 grouped-GEMM runs at 96/83/55% of the memory roofline at chunk 512/2048/8192 -- bigger chunks amortize the fixed ~8ms weight sweep per layer.
-
-3. **Deep-decode bandwidth — `mods/diffkv-kernel-bw` now default in the prod recipe** (`VLLM_DIFFKV_SEGMENTS` 16->64 in the 3D split-KV decode): +18% @200K / +5% @400K no-spec decode, needle-verified.
-
-Operational hardening (see `systemd/`): the pre-start now pauses neo4j during vLLM's startup memory profiling (the 0.86-util guard is razor-thin on GB10; any ~1-2 GiB co-resident service fails the boot) and kills known guard-margin eaters; an `ExecStartPost` re-triggers the dependent-services gate after every restart. Pool at util 0.86 / mml 500K with all services online: **~1.58M tokens (3.17x concurrency)**.
-
-## Why this exists
-
-MiMo-V2.5 (a ~309B-total MoE) has no official recipe for the GB10 / sm_121 platform, and the
-naive vLLM paths (Flash-DiffKV, Triton-DiffKV) either crash or produce garbage on sm_121. This
-repo captures a working, tuned configuration: the base upstream vLLM image plus a small set of
-**mods** (runtime patches applied at container start) that make MiMo-V2.5 + DFlash + fp8-KV run
-correctly and fast on dual GB10 — including at deep context, which is where the interesting
-engineering lives.
-
-## Results (measured)
-
-| Metric | Value |
-|---|---|
-| KV-cache pool (util 0.86, mml 500K, **`limit-mm-per-prompt video:0`**) | **~1.5M tokens** (3.18× a 500K request). The single biggest lever was *not* the KV format — it was dropping the multimodal **video worst-case from startup profiling** (`{"image":2,"video":0,"audio":1}`), which was reserving ~10.6 GiB/rank of encoder-cache; that reservation is what capped the pool at ~236K. Measure with your real service load online — don't strip services to inflate it. |
-| Long context | validated to **240K real tokens with correct needle recall**; `max_model_len=500000` |
-| Short-context decode | JSON ~48–52 / code ~44 tok/s |
-| Multi-stream (code, mns=8, cudagraph) | 1: 33 · 2: 52 (28 ea) · 4: 69 (20 ea) · 8: 111 tok/s aggregate (sub-linear — see below) |
-| **Deep decode, honest** (real prose, **real temperature**, thinking-off) | *without the deep-context fixes (drafter collapses at depth):* 100K: 12 · 200K: 10 · 300K: 5 · 400K: 4 tok/s. **With the fixes ([Deep-context decode](#deep-context-decode)): ~28–35 (structured) / ~14–18 (prose) tok/s @400K.** Prefill ≈ 0.8 s / 1K tokens (400K ≈ 5 min cold). |
-| Tool-calling quality (tool-eval-bench) | 90 / ★★★★★ Excellent, 0 safety warnings |
-| Reliability (reliability-bench v1_full) | on par with the fp16/fp8 baseline (existence 24/24, refusal 9/9) |
-
-**Measure honestly.** Two traps we fell into and fixed: (1) `temperature=0` + repetitive/synthetic
-prompts *inflate* speculative-decoding accept-length and overstate tok/s — measure at your real
-serving temperature with real, non-repetitive content; (2) speculative decode streams **per step,
-not per token**, so count tokens via `usage.completion_tokens` (`stream=False`), never by counting
-SSE chunks. Deep-context decode is bounded by full-attention O(context) growth — 500K context is
-usable (works, recalls) but decodes slower at depth even with speculation on. Speculative decode is
-single-stream-latency optimized: the per-stream drafter cost does not amortize across concurrent
-requests, so aggregate throughput scales sub-linearly (good for "one big stream + a few side streams").
+> Engineering notes, A/B data and the full optimization history live in **[HISTORY.md](HISTORY.md)**.
 
 ## Hardware
 
 - 2× NVIDIA DGX Spark (GB10, sm_121a, 128 GB unified memory each, ~120 GB usable)
-- Cross-node interconnect for NCCL (RoCE)
-- Head node (rank 0) + worker (rank 1), TP=2 over Ray
+- Cross-node interconnect for NCCL (RoCE) · head (rank 0) + worker (rank 1), TP=2 over Ray
 
-## Base image & build environment
+## Quick start
 
-The recipe runs inside a locally-built vLLM image; the `mods/` reproduce the exact deltas on
-top of upstream vLLM, so the setup is reproducible from an equivalent build.
+```bash
+# 1) Pull the pre-built vLLM image (linux/arm64, CUDA 13.2, sm_121a, ~19.4 GB):
+docker pull ghcr.io/henryous/mimo-v25-dflash-dgx-spark:latest
 
-| | |
+# 2) Assemble the exact prod checkpoint:
+#    a) base ~171 GB:
+hf download lukealonso/MiMo-V2.5-NVFP4 --local-dir MiMo-oproj-mxfp8
+#    b) our o_proj-MXFP8 overlay (4 files, ~1.7 GB) INTO that same dir
+#       (overwrites the 3 JSONs, adds the requant shard):
+gh release download prod-overlay-v1 -R HeNryous/mimo-v25-dflash-dgx-spark -D MiMo-oproj-mxfp8
+#    c) DFlash drafter (dflash/ subdir of XiaomiMiMo/MiMo-V2.5-DFlash) into mimo-dflash/dflash/,
+#       then bump its config.json: "max_position_embeddings": 524288  (both nodes)
+
+# 3) One-time: clear any stale torch-compile cache (both nodes), or the drafter
+#    silently keeps the old 262K RoPE table:
+sudo rm -rf ~/.cache/vllm/torch_compile_cache
+
+# 4) Launch — the recipe applies mods/ at container start (head node, rank 0):
+./run-recipe.sh -d recipes/mimo-fp8kv-prod.yaml
+
+# Or as a persistent service:
+sudo cp systemd/mimo-fp8kv-prod.service /etc/systemd/system/
+sudo cp systemd/mimo-fp8kv-pre-start.sh systemd/mimo-fp8kv-post-start.sh /usr/local/bin/
+sudo systemctl enable --now mimo-fp8kv-prod
+```
+
+The recipe brings up both nodes (TP=2 over Ray) and serves an OpenAI-compatible API:
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"mimo-dflash-test","messages":[{"role":"user","content":"Write a binary search in Python."}]}'
+```
+
+Serve **greedy (temperature 0) with thinking off** for agentic/tool use — a 14-run sampling sweep
+found the model-card defaults (temp 1.0 / top_p 0.95) measurably *worse* for tool-calling and no
+arm better than greedy ([details](HISTORY.md#sampling-sweep)).
+
+## Expected results
+
+All measured on this exact config (2× GB10, TP=2, all co-resident services online).
+Tokens counted via `usage.completion_tokens`, never SSE chunks (DFlash streams per *step*).
+
+**Quality**
+
+| Benchmark | Score |
 |---|---|
-| Base image | `vllm-node-mimo-v25-upstream` (local build), 19.4 GB, **linux/arm64** |
-| vLLM | `0.23.1rc1.dev760+g3775d5fca` (upstream `main` @ 3775d5fca, ~2026-07-05, post PR #46104) |
-| CUDA | 13.2.0 (`NVIDIA_REQUIRE_CUDA cuda>=13.2`, driver ≥ 535) · Python 3.12 |
-| GPU arch | NVIDIA GB10 (Grace-Blackwell), **sm_121a**, ARM64 host, 128 GiB unified memory/node |
-| Weights on GPU | ~86.9 GiB/rank (MoE nvfp4 + o_proj MXFP8) |
+| reliability-bench `v1_full` (79 tasks) | **57/79** first-pass (existence 23/24, refusal 9/9) |
+| tool-eval-bench (69 scenarios) | **87 ± 2** (11-run band; single runs up to 91), 0 safety warnings |
+| Loop battery (12 loop-prone prompts) | 0/12 loops |
+| Needle-in-haystack | PASS @126K, validated to 240K real tokens |
 
-**Already native in this vLLM build** (the mods do NOT re-add these): `TRITON_ATTN_DIFFKV`
-attention backend (PR #41797); `MiMoV2` / `MiMoV2Omni` / `DFlashDraftModel` in the model
-registry; DFlash aux+1 / SWA window symmetrization (#40727).
+**Throughput — single stream** (greedy, real content, short context)
 
-**What the mods add on top** (upstream still lacks these for this exact fp8-KV + DFlash path):
-- `fp8-kv-inline` — accept fp8 KV in the DiffKV Triton backend + in-kernel bitcast+multiply descale
-- `fix-mimo-v2-upstream` — `MimoV2Config` HF registration + Omni audio deps (soundfile/librosa/av)
-- `mimo-chat-template` — MiMo chat template (bounded reasoning) + reasoning parser
-- `nvfp4-draft-bf16` / `nvfp4-draft-blocksize` — force the DFlash drafter KV to bf16 / block-16 (anti-padding)
-- `ray-cvd-fallback` — Ray accelerator ordinal fallback (fixes a CUDA_VISIBLE_DEVICES crash under TP)
-- `omni-eagle3` — expose `SupportsEagle3` on `MiMoV2Omni` so the DFlash drafter can attach its EAGLE3 aux-hidden-state interface (upstream #46104 added it only to the non-Omni `MiMoV2Flash` class)
-- `diffkv-3d-qlen8` / `dflash-cliff-fix` — keep speculation fast and alive at deep context (see [Deep-context decode](#deep-context-decode))
+| Content | tok/s |
+|---|---|
+| JSON / structured | ~54 (accept-length ≈ 5.5) |
+| Code | ~44 |
+| Prose | ~28 |
 
-**Model & quantization** (base weights from Hugging Face; our small requant overlay is a [GitHub release](https://github.com/HeNryous/mimo-v25-dflash-dgx-spark/releases/tag/prod-overlay-v1)):
+**Throughput — concurrent streams** (400-token JSON generations, temp 0.7)
 
-- **Target — MiMo-V2.5**, NVIDIA **ModelOpt `MIXED_PRECISION`**. Built from
-  [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) plus our
-  `o_proj` requant overlay (`model-oproj-lmhead-requant.safetensors`), published as the
+| Streams | Aggregate tok/s | Per-stream tok/s |
+|---|---|---|
+| 1 | 37 | 37 |
+| 2 | 39 | 19 |
+| 4 | 86 | 21 |
+| 6 | 113 | 19 |
+
+**Latency and depth** (cold = unique prompt, no prefix-cache hit)
+
+| Context depth | Cold TTFT | Decode after prefill |
+|---|---|---|
+| 50K | ~24 s | ~50+ tok/s (structured) |
+| 200K | ~170 s | ~22–25 tok/s |
+| 400K | ~580 s | ~28–35 structured / ~14–18 prose tok/s |
+
+**Multi-stream under load** — a 150K-token prefill running next to a live decode stream:
+prefill completes in **89 s**, the parallel stream keeps flowing at **148 ms median** inter-token
+gap (worst ~4 s). Without the shipped fairness flag this freezes the stream for the full ~2 minutes.
+
+**Context**: `max_model_len 500000`, KV pool **1.67M tokens** (3.33× concurrency at full 500K),
+measured with neo4j/monitoring/agents co-resident — don't strip services to inflate pool numbers.
+
+## Model & quantization
+
+- **Target — MiMo-V2.5** in NVIDIA ModelOpt `MIXED_PRECISION`, built from
+  [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) + our
   [`prod-overlay-v1`](https://github.com/HeNryous/mimo-v25-dflash-dgx-spark/releases/tag/prod-overlay-v1)
-  release — drop its 4 files into the base checkout to reproduce the **exact** checkpoint we serve
-  (a directory labelled `MiMo-oproj-mxfp8`). Per-layer scheme (from `hf_quant_config.json`):
-  - **NVFP4** (NVIDIA 4-bit float, 16-value micro-blocks) — MoE experts + most linear projections; the bulk of the ~309B weights
-  - **MXFP8** (8-bit microscaling) — attention output `o_proj` in every layer, via the local requant; buys ~8.5% KV headroom / a little quality at **no decode-speed cost**
-  - **bf16, un-quantized** (`exclude_modules`) — `lm_head`, `embed_tokens`, final `norm`, RoPE tables, the vision + audio/speech encoders, and the first layers' MoE `gate` / `shared_expert`
-  - ~86.9 GiB/rank on GPU
-- **Drafter — DFlash** (5-layer Qwen3, non-causal, sliding-window 1024), `num_speculative_tokens=7`
-- **KV cache** is quantized separately at runtime to **fp8-e4m3** — a decode-time *cache* format, independent of the weight quantization above (see the knobs table)
-- Served under two aliases: `MiMo-V2.5-NVFP4` and `mimo-dflash-test`
-
-> **The pre-built image is published — pull it instead of building:**
-> `docker pull ghcr.io/henryous/mimo-v25-dflash-dgx-spark:latest`
-> (linux/arm64, CUDA 13.2, sm_121a, ~19.4 GB). The `mods/` are still applied at container start by
-> the recipe, and the model weights are pulled from Hugging Face separately (see above). To rebuild
-> from scratch instead: build upstream vLLM `main` @ ~3775d5fca for CUDA 13.2 / sm_121, then apply
-> the `mods/` (each is a marker-guarded, idempotent `run.sh` that patches site-packages in place).
-
-## Deep-context decode
-
-Keeping speculative decoding useful *at depth* — not just at short context — took two fixes.
-Both ship in the mods above and are **enabled by default**; together they take deep single-stream
-decode at 400K from ~4 tok/s (drafter effectively off) to **~28–35 tok/s** on structured content.
-This is the part that isn't obvious from a stock config, so it's documented in full.
-
-### 3D split-KV for the DFlash verify shape (`diffkv-3d-qlen8`)
-
-DFlash's verify shape is `q_len = 8`, but the DiffKV Triton launcher gated its 3D
-split-KV / FlashDecoding path behind `max_seqlen_q > 1` — so the 8-wide verify fell back to a
-**2D kernel running ~16 CTAs on the 48-SM GPU (~6–7 % of memory bandwidth)**. Admitting
-`q_len ≤ 8` into the 3D path (env `VLLM_DIFFKV_3D_Q8=1`) launches ~256 CTAs instead:
-
-- **deep-spec decode +85 % @ 400K** (3.9 → 7.2 tok/s), memory-neutral, numerically identical
-  (needle-in-haystack @125K verified, no sm_121 miscompile at 64+ softmax segments).
-
-### Speculation past 262 144 tokens (`dflash-cliff-fix` + a drafter config bump)
-
-The DFlash drafter's RoPE `cos_sin_cache` is sized from its `max_position_embeddings` (`262144`),
-and vLLM's `_input_fits_in_drafter` guard silently **disables speculation above 262 136 tokens**
-to avoid an out-of-bounds RoPE gather — so at 300K–500K the drafter was off (`accept_len = 1.0`)
-and deep decode crawled. The fix has three parts:
-
-1. Bump the drafter's `config.json` → `"max_position_embeddings": 524288` (both nodes).
-2. `dflash-cliff-fix` (env `VLLM_DFLASH_MAXPOS=1`) extends the RoPE table to the target
-   `max_model_len` and adds a **saturating** position clamp as an OOB belt (never EAGLE-style
-   clamp-to-zero — that corrupts the relative RoPE offset).
-3. **Wipe the torch-compile cache once** as root (`sudo rm -rf ~/.cache/vllm/torch_compile_cache`
-   on both nodes) so the drafter recompiles with the extended RoPE. The cache is keyed on config
-   and lives on a host bind-mount that **survives container recreation** — otherwise a stale hit
-   serves the old 262144-bound Inductor kernel and the fix silently no-ops (verify the fresh
-   `…/eagle_head/computation_graph.py` shows `cos_sin_cache: bf16[524288, 64]` before traffic).
-
-Acceptance at 400K then goes **1.0 → ~3.8** on structured content (JSON/code) → **deep-spec decode
-~4× (≈7 → ~28–35 tok/s @400K)**, quality-neutral: speculation is lossless — the target verifies
-every token, and the config only changes *where* the drafter engages, not the output. The drafter's
-sliding-window-1024 attention keeps acceptance healthy at any absolute depth (relative RoPE offsets
-stay in-distribution).
-
-### What doesn't help — and why
-
-- **KV-sparsity (Quest)** and **acceptance-adaptive `num_speculative_tokens`** both change the
-  decode `q_len`/shape at runtime → the batch misses the captured CUDA graph → attention falls back
-  to eager, which *negates* the saving exactly at deep context where it's needed. Only changes that
-  **respect the captured shape** (the two above) or are **orthogonal** to it pay off.
-- **MoE-backend autotune** is neutral — deep decode is weight-bandwidth-bound, not MoE-GEMM-bound.
-
-### The ceiling, and what's next
-
-Deep single-stream @400K is bounded by a ~34–38 ms/step MoE weight-streaming floor plus the KV
-read. Realistic deep decode is **~28–35 tok/s (structured) / ~14–18 (prose)** — not 40+. The
-attention kernel itself reads at only ~21 % of the 273 GB/s LPDDR bandwidth (parallelism-starved at
-`q_len=1`), but widening it helps only the no-spec path.
-
-A tempting next lever is **decode context-parallelism** (DCP) — splitting the KV sequence across
-both GB10 nodes for a projected ~1.5–1.8× at depth. **It does not work on this configuration, and
-the reason is architectural, not a tuning gap.** vLLM gates DCP for non-MLA (GQA/MQA) attention
-behind `tensor_parallel_size > total_num_kv_heads` **and** `dcp_size ≤ tensor_parallel_size //
-num_kv_heads` (`vllm/config/model.py`). MiMo-V2.5 has **4 full-attention KV heads**, so `dcp_size = 2`
-requires `tensor_parallel_size ≥ 8` — i.e. **8 GPUs**. On 2× GB10 (TP=2) the config validator
-rejects DCP at startup (a pydantic `ValidationError`, before weights even load). No flag or mod
-bypasses it; only MLA models (a single latent KV head, e.g. DeepSeek) sidestep the constraint,
-because non-MLA DCP works by *replicating* KV heads across the spare ranks above `num_kv_heads` —
-ranks that simply don't exist at TP=2 with 4 KV heads.
-
-A drafted DiffKV DCP implementation lives in `mods/dcp-diffkv` (env-gated, off by default) and is
-kept only as a **reference**: the per-token LSE expose from the DiffKV reduce, the exact
-LSE-weighted cross-rank combine, and the metadata seq-len split are in place; the context/query
-attention decomposition is unfinished. It could only ever benefit a **MQA DiffKV model (1 KV head)
-or an ≥8-GPU deployment** — never MiMo on two Sparks. Verified empirically (July 2026) at the
-cheapest possible gate: config validation, seconds into boot.
-
-## Repository layout
-
-```
-recipes/
-  mimo-fp8kv-prod.yaml       # the production recipe (cudagraph, mns=8, fp8-KV, DFlash)
-mods/                        # runtime patches, applied in recipe order at container start
-  drop-caches/               # page-cache drop before launch
-  fix-mimo-v2-upstream/      # MiMo-V2.5 support for the upstream vLLM image (config reg, DiffKV fp8, audio deps)
-  nvfp4-draft-bf16/          # force the DFlash drafter's KV to bf16
-  nvfp4-draft-blocksize/     # drafter block_size 32->16 (reduce uniform-page padding)
-  fp8-kv-inline/             # in-kernel fp8 KV descale fast-path (bitcast + multiply)
-  diffkv-3d-qlen8/           # 3D split-KV for the DFlash q_len=8 verify shape (+85% deep-spec @400K)
-  dflash-cliff-fix/          # unlock speculation past 262K tokens (extend drafter RoPE to max_model_len)
-  ray-cvd-fallback/          # Ray accelerator ordinal fallback (fixes a CVD crash under TP)
-  omni-eagle3/               # add SupportsEagle3 to MiMoV2Omni (DFlash EAGLE3 aux interface)
-  mimo-chat-template/        # writes the MiMo chat template (bounded reasoning) into the container
-  dcp-diffkv/                # REFERENCE ONLY — DCP draft; config-blocked on 2 GPUs (non-MLA DCP needs TP>=8 for 4 KV heads)
-systemd/
-  mimo-fp8kv-prod.service    # persistent daily-driver unit (auto-boot, crash-restart, memory cleanup)
-  mimo-fp8kv-pre-start.sh    # pre-start cleanup: stop containers + UVM reset + drop_caches (both nodes)
-```
+  release (o_proj → MXFP8 requant; the overlay is **required** — the stock checkpoint garbles on
+  this image). NVFP4 experts, MXFP8 `o_proj`, bf16 `lm_head`/embeddings. ~86.9 GiB/rank on GPU.
+- **Drafter — DFlash** (5-layer Qwen3, non-causal, sliding-window 1024), `num_speculative_tokens=7`.
+- **KV cache** quantized at runtime to **fp8-e4m3** (decode-time cache format, independent of weights).
+- Base image: upstream vLLM `main` @ 3775d5fca (`0.23.1rc1.dev760`), CUDA 13.2, Python 3.12.
+  The `mods/` are marker-guarded idempotent patches applied at container start — see
+  [repository layout](#repository-layout) and [HISTORY.md](HISTORY.md) for what each one does and why.
 
 ## Key configuration knobs
 
 | Knob | Value | Why |
 |---|---|---|
-| `--kv-cache-dtype fp8` + `VLLM_FP8_INLINE=1` | fp8 e4m3, in-kernel descale | 5.8× KV pool; dequant = bitcast+multiply (3.5–4.8× faster than nvfp4 unpack+LUT) |
-| `--speculative-config … method=dflash, num_speculative_tokens=7` | DFlash drafter | ~2× single-stream |
-| `VLLM_DIFFKV_3D_Q8=1` + `VLLM_DFLASH_MAXPOS=1` (+ drafter `max_position_embeddings=524288`) | deep-context spec | keeps speculation on and fast past 262K (see [Deep-context decode](#deep-context-decode)) |
-| `--compilation-config cudagraph_capture_sizes=[1,2,4,8,16,24,32,48,64]` | CUDA graphs | multiples of 8 = DFlash decode batch (num_seqs × (num_spec+1)); +5–8% at concurrency |
-| `gpu_memory_utilization: 0.86` | hard ceiling on GB10 | 0.87/0.88 freeze the node (unified-memory startup guard) |
-| `max_num_seqs: 8` | concurrency cap | "1 big + a few side streams" |
-| `--load-format auto` | — | `fastsafetensors` (GDS/cufile) freezes GB10; `instanttensor` costs ~40% pool |
-| `--chat-template mimo_chat_template.jinja` | bounded reasoning | prevents the reasoning-boundary over-thinking that truncates long answers |
+| `--kv-cache-dtype fp8` + `VLLM_FP8_INLINE=1` | fp8 e4m3, in-kernel descale | 5.8× KV pool vs bf16; dequant = bitcast+multiply |
+| `--speculative-config … dflash, num_speculative_tokens=7` | DFlash drafter | ~2× single-stream |
+| `VLLM_DIFFKV_3D_Q8=1` + `VLLM_DFLASH_MAXPOS=1` | deep-context spec | speculation stays on and fast past 262K |
+| `mods/diffkv-prefill-tune` (default-on) | prefill kernel tune | bit-identical, cold TTFT −13/−23/−28 % @50/200/400K |
+| `--long-prefill-token-threshold 4096` | prefill/decode fairness | no decode freeze during long prefills (vLLM's auto-default is inert — set explicitly) |
+| `VLLM_DIFFKV_BW=1` (`mods/diffkv-kernel-bw`) | 3D decode segments 16→64 | +18 % deep decode @200K |
+| `cudagraph_capture_sizes=[1,2,4,8,…,64]` | CUDA graphs | multiples of 8 = DFlash batch shape |
+| `gpu_memory_utilization: 0.86` | hard GB10 ceiling | 0.87/0.88 freeze the node |
+| `--load-format auto` | — | `fastsafetensors` freezes GB10 |
 
-## GB10 operational notes (hard-won)
+## GB10 operational notes
 
-- **Unified-memory freeze:** filling memory hangs the whole node. Keep `gpu_memory_utilization ≤ 0.86`.
-- **Pool size depends on free memory at boot:** the KV pool is sized at profiling time, so a clean
-  boot (full reboot → `drop_caches`) yields a materially larger pool than a dirty one. The pre-start
-  script does UVM reset + `drop_caches` on both nodes.
+- **Unified-memory freeze:** keep `gpu_memory_utilization ≤ 0.86`. Filling memory hangs the node.
+- **Pool size is set at boot profiling:** clean boot (UVM reset + `drop_caches`) = bigger pool.
+  The pre-start script does this on both nodes, pauses co-resident services during profiling
+  (the 0.86 guard is razor-thin — any ~1–2 GiB neighbor fails the boot), and the post-start
+  re-triggers them after vLLM is healthy.
 - **`fastsafetensors` freezes GB10** — use `--load-format auto`.
-- Never `grep` recursively over `/proc` (kcore) on GB10 — it soft-locks the CPU.
+- Never `grep` recursively over `/proc` on GB10 (kcore soft-locks the CPU).
 
-## Quick start
+## Repository layout
 
-```bash
-# 1) Pull the pre-built vLLM image (no local build needed):
-docker pull ghcr.io/henryous/mimo-v25-dflash-dgx-spark:latest
-
-# 2) Assemble the exact prod checkpoint (see "Model & quantization"):
-#    a) base ~171 GB:  hf download lukealonso/MiMo-V2.5-NVFP4 --local-dir MiMo-oproj-mxfp8
-#    b) our o_proj-MXFP8 overlay (4 files, ~1.7 GB) INTO that same dir
-#       (overwrites the 3 JSONs, adds the requant shard):
-#       gh release download prod-overlay-v1 -R HeNryous/mimo-v25-dflash-dgx-spark -D MiMo-oproj-mxfp8
-#    c) DFlash drafter -> XiaomiMiMo/MiMo-V2.5-DFlash (dflash/ subdir) into mimo-dflash/dflash/
-
-# 3) Launch — the recipe applies the mods/ at container start:
-# Head node (rank 0):
-./run-recipe.sh -d recipes/mimo-fp8kv-prod.yaml
-
-# Or as a persistent service:
-sudo cp systemd/mimo-fp8kv-prod.service /etc/systemd/system/
-sudo cp systemd/mimo-fp8kv-pre-start.sh /usr/local/bin/
-sudo systemctl enable --now mimo-fp8kv-prod
+```
+recipes/mimo-fp8kv-prod.yaml   # THE production recipe (everything above wired together)
+mods/                          # runtime patches, applied in recipe order at container start
+  fix-mimo-v2-upstream/        #   MiMo-V2.5 + fp8-DiffKV support on the upstream image
+  fp8-kv-inline/               #   in-kernel fp8 KV descale fast-path
+  diffkv-3d-qlen8/             #   3D split-KV for the DFlash verify shape (+85 % deep-spec)
+  diffkv-kernel-bw/            #   decode segment tuning (+18 % deep)
+  diffkv-prefill-tune/         #   prefill kernel tune (bit-identical, −23 % TTFT @200K)
+  dflash-cliff-fix/            #   speculation past 262K (drafter RoPE extension)
+  nvfp4-draft-bf16/ nvfp4-draft-blocksize/ ray-cvd-fallback/ omni-eagle3/ mimo-chat-template/ drop-caches/
+  dcp-diffkv/                  #   REFERENCE ONLY — abandoned, see HISTORY.md
+systemd/                       # persistent service + hardened pre/post-start
+benchmarks/                    # sampling sweep runner + kernel parity harness (reference)
 ```
 
-The recipe brings up both nodes (TP=2 over Ray) and serves an OpenAI-compatible API.
+## Credits & license
 
-```bash
-curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"mimo-dflash-test","messages":[{"role":"user","content":"Write a binary search in Python."}]}'
-```
+[Xiaomi MiMo-V2.5](https://huggingface.co/XiaomiMiMo) ·
+[`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) ·
+[vLLM](https://github.com/vllm-project/vllm) · DFlash speculative decoding.
+Configuration and mods: MIT. Model weights under their own licenses.
 
-## Credits
-
-- [Xiaomi MiMo-V2.5](https://huggingface.co/XiaomiMiMo) — the base model
-- [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) — the ModelOpt NVFP4 base quantization
-- [vLLM](https://github.com/vllm-project/vllm) — the serving engine
-- DFlash speculative decoding
-
-## License
-
-Configuration and mods: MIT. The model weights are governed by their own license (see the
-MiMo-V2.5 model card).
+**How we got here** — kernel work, A/B data, measured dead ends: **[HISTORY.md](HISTORY.md)**.
