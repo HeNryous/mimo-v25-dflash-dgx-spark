@@ -33,6 +33,7 @@ mods:
   - mods/omni-eagle3
   - mods/mimo-chat-template
   - mods/diffkv-prefill-tune
+  - mods/vit-sdpa-window
 
 defaults:
   port: 8000
@@ -96,6 +97,11 @@ env:
   # cliff-fix: spec >262K unlocked (drafter max_position 524288 + RoPE-extend + clamp belt)
   VLLM_DFLASH_MAXPOS: "1"
   VLLM_DIFFKV_PREFILL_TUNE: "32,4,2,32"
+  # Omni vision fix 2026-07-11 (gates 7/7): ViT windowed-SWA via chunked
+  # masked SDPA + learned sink logits, replacing the FA path (which silently
+  # dropped the loaded sinks and corrupted non-deterministically on sm_121).
+  # Set "0" to A/B back to the original FA path.
+  VLLM_VIT_SDPA_WINDOW: "1"
   # NOTE: the dev114 MoE-FP4 env trio (VLLM_NVFP4_GEMM_BACKEND,
   # VLLM_USE_FLASHINFER_MOE_FP4, VLLM_FLASHINFER_MOE_BACKEND) was REMOVED from
   # this image's envs.py (refactored away on main; no code references them).
@@ -113,6 +119,7 @@ command: |
       --kv-cache-dtype fp8 \
       --block-size 32 \
       --attention-backend triton_attn_diffkv \
+      --mm-encoder-attn-backend TORCH_SDPA \
       --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"],"attention_chunk_size":null}}' \
       --limit-mm-per-prompt '{{"image":2,"video":0,"audio":1}}' \
       --host {host} \

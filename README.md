@@ -145,6 +145,7 @@ mods/                          # runtime patches, applied in recipe order at con
   diffkv-kernel-bw/            #   decode segment tuning (+18 % deep)
   diffkv-prefill-tune/         #   prefill kernel tune (bit-identical, −23 % TTFT @200K)
   dflash-cliff-fix/            #   speculation past 262K (drafter RoPE extension)
+  vit-sdpa-window/             #   Omni vision fix: ViT windowed-SWA via masked SDPA + sinks
   nvfp4-draft-bf16/ nvfp4-draft-blocksize/ ray-cvd-fallback/ omni-eagle3/ mimo-chat-template/ drop-caches/
   dcp-diffkv/                  #   REFERENCE ONLY — abandoned, see HISTORY.md
 systemd/                       # persistent service + hardened pre/post-start

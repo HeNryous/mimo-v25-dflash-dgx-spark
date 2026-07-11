@@ -177,3 +177,37 @@ serving temperature with real, non-repetitive content; (2) speculative decode st
 not per token** — count tokens via `usage.completion_tokens` (`stream=False`), never SSE chunks.
 Speculative decode is single-stream-latency optimized: the per-stream drafter cost does not
 amortize across concurrent requests, so aggregate throughput scales sub-linearly.
+
+
+## 2026-07-11 — Omni vision fixed (gates 7/7), audio verified, video costed
+
+**Vision was broken in every prior cut of this recipe and nobody noticed** (text-only
+clients). Symptom: image requests were accepted but the model confabulated — flat-color
+test images came back as "brown"/"grey"/"black", *non-deterministically* (same image,
+temp 0, different wrong answer per run); textured photos mostly survived.
+
+**Root cause (two layers):** `--mm-encoder-attn-backend` only reaches the 4 full-attention
+ViT blocks (`MMEncoderAttention`). The other 24 windowed-SWA blocks call
+`flash_attn_varlen_func(window_size=[64,64])` **hardcoded** — no backend enum value reaches
+them — and they **silently drop the learned attention sinks** (`use_sink=true`; the code
+even says "loaded but not used in vLLM flash_attn"). The isolated FA kernel measured
+numerically fine on sm_121 (max-abs 4e-3 vs an SDPA reference on the real shape), so the
+missing sinks are the prime suspect: without the trained sink logit, softmax collapses
+exactly in uniform windows — killing flat/low-frequency color while textured content survives.
+
+**Fix — `mods/vit-sdpa-window` + `--mm-encoder-attn-backend TORCH_SDPA`:** replaces the
+windowed path with chunked masked SDPA-math in fp32 (banded mask |i−j|≤64 per cu_seqlens
+segment, GQA-aware, TP-rank sink slice) **and applies the sink logits** (appended column
+pre-softmax). Bit-exact vs a naive reference offline. Env-gated: `VLLM_VIT_SDPA_WINDOW=0`
+restores the FA path byte-for-byte. Gate battery (both split axes, checkerboard colors,
+3x determinism, COCO photo): **7/7 PASS**, deterministic. KV pool unchanged (1.709M tokens
+@ util 0.86 / mml 500K). Text speed unchanged (accept 5.3, ~52 tok/s JSON).
+
+**Audio** verified end-to-end on the same boot: tone description and exact speech
+transcription (espeak sample) both correct — `audio:1` was already in the recipe.
+
+**Video stays off (`video:0`), measured why:** vLLM reserves the profiling worst case
+(14 frames × max resolution; `mm_processor_kwargs` are ignored by the profiler) —
+**~9.9 GiB/rank** (available KV 13.96→4.12 GiB rank0, 11.55→1.68 GiB rank1). At mml 500K
+the boot fails outright (needs 3.49 GiB for a single request); the surviving pool would cap
+mml at ~196K. Re-enabling video means either dropping mml or patching the profiler.
