@@ -211,3 +211,48 @@ transcription (espeak sample) both correct — `audio:1` was already in the reci
 **~9.9 GiB/rank** (available KV 13.96→4.12 GiB rank0, 11.55→1.68 GiB rank1). At mml 500K
 the boot fails outright (needs 3.49 GiB for a single request); the surviving pool would cap
 mml at ~196K. Re-enabling video means either dropping mml or patching the profiler.
+
+
+## 2026-07-12 — Swap thrashing found & neutralized (zram), OOM protection, content-bound speed mapped
+
+**The incident.** After a multi-day background backlog (our memory provider
+consolidating with up to 7 parallel LLM requests — legitimate load the engine
+handled fine), the host had quietly pushed **8.1 GB (node 0) / 6.0 GB (node 1)
+into disk swap**. The engine kept "working" but decode collapsed to **11 tok/s
+single-stream with accept ≈ 2.4 on content that normally runs 48+** — while
+`free` showed RAM "available" recovering. The tell was `vmstat`: continuous
+swap-ins (~80-170 pages/s) — hot pages living on the SSD. Lesson: **"available
+RAM" alone is a blind spot; watch swap-used.** A `swapoff` rescue is impossible
+at that point (needs more free RAM than exists); only a maintenance reboot
+restores full speed.
+
+**Structural fix — zram (both nodes):** `zram-tools`, `ALGO=zstd SIZE=8192
+PRIORITY=100` (above the disk swapfile's -2). Validated across a reboot: the
+~4.3 GB that weight-loading displaces at util 0.86 now lands entirely in
+compressed RAM (~1.5 GB physical), **disk swap stays at 0 B**, and future
+pressure spikes cost microseconds instead of SSD round-trips. At this util the
+box always operates at the memory edge — that is the price of the ~1.6-1.8M
+token pool; zram makes the edge non-toxic.
+
+**OOM-killer inversion:** Ray tags its workers `oom_score_adj 1000` — under
+real OOM the kernel kills the 100-GB engine worker FIRST (we lost a prod worker
+to a runaway cron this way in June). `systemd/oomprotect.sh` pins engine
+processes to -500, re-applied by the post-start hook every boot. Expendable
+scripts die first; the model survives.
+
+**Content-bound speed, finally mapped clean** (fresh boot, empty engine,
+`usage.completion_tokens`): DFlash accept-length is a property of the CONTENT —
+JSON/structured ≈ 4.5-5.5 accept → 48-59 tok/s single; free prose ≈ 2.0-2.6 →
+~23 tok/s, independent of language and temperature. Under concurrency accept
+STAYS at its content level (the drafter is innocent); per-stream decay is MoE
+coverage: C=6 JSON = 26-30 per stream / ~136 aggregate (step time 94→235 ms as
+48 concurrent tokens touch nearly all experts). Practical triage rule: **prose
+at 23 is physics; JSON below ~40 is a substrate problem.** Corollary: any
+benchmark taken on a swap-degraded node is garbage — we invalidated one full
+sweep this way before rebooting.
+
+**Provenance note:** the drafter shipped in this recipe is byte-identical to
+Xiaomi's official `XiaomiMiMo/MiMo-V2.5-DFlash` release (sha256 match on
+`dflash_draft_model.safetensors`) — the official drop validates this stack;
+our additions on top remain the fp8-KV path, the >262K RoPE cliff-fix, the
+prefill tune and the ViT vision fix.

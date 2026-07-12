@@ -124,6 +124,24 @@ measured with neo4j/monitoring/agents co-resident — don't strip services to in
 | `gpu_memory_utilization: 0.86` | hard GB10 ceiling | 0.87/0.88 freeze the node |
 | `--load-format auto` | — | `fastsafetensors` freezes GB10 |
 
+**Throughput — content-bound reality (measured 2026-07-12, fresh boot)**
+
+DFlash accept-length is set by how predictable the CONTENT is, not by load:
+
+| Content | single stream | 6 streams (per-stream / aggregate) | accept |
+|---|---|---|---|
+| JSON / structured / code | ~48-59 | 26-30 / ~136 | 4.5-5.5 (stable under load) |
+| Free prose (any language, any temp) | ~23 | 11-14 / ~60 | ~2.0-2.6 |
+
+Multi-stream scaling is MoE-coverage physics: 48 concurrent tokens activate
+nearly all experts, so a step reads ~2.5x the weight bytes of a single-stream
+step over the same fixed bandwidth. Aggregate keeps growing with more streams
+(coverage saturates; ~490 tok/s measured at C=32 on an earlier cut).
+
+**Substrate health rule of thumb:** prose at 23 and JSON at 48+ is normal.
+If JSON tasks drop clearly below ~40 tok/s single-stream, suspect the
+substrate (swap thrashing, see operational notes) — not the model.
+
 ## GB10 operational notes
 
 - **Unified-memory freeze:** keep `gpu_memory_utilization ≤ 0.86`. Filling memory hangs the node.
@@ -131,6 +149,30 @@ measured with neo4j/monitoring/agents co-resident — don't strip services to in
   The pre-start script does this on both nodes, pauses co-resident services during profiling
   (the 0.86 guard is razor-thin — any ~1–2 GiB neighbor fails the boot), and the post-start
   re-triggers them after vLLM is healthy.
+- **Swap thrashing silently destroys throughput (and how to make it harmless):**
+  at util 0.86 the weight-load itself displaces ~5-6 GB to swap on every boot, and any
+  memory-pressure burst (e.g. many parallel background requests) pushes *hot* pages after
+  it. Symptom: everything still "works" but decode collapses (we measured 11 tok/s single /
+  accept 2 on JSON that normally does 48+), `vmstat` shows continuous swap-ins, and RAM
+  "available" looks fine again while GBs sit in swap. Fix — route swap into compressed RAM:
+
+  ```bash
+  # both nodes
+  sudo apt-get install -y zram-tools
+  printf 'ALGO=zstd\nSIZE=8192\nPRIORITY=100\n' | sudo tee /etc/default/zramswap
+  sudo systemctl enable --now zramswap.service && sudo systemctl restart zramswap.service
+  swapon --show   # /dev/zram0 prio 100 must sit above the disk swapfile (prio -2)
+  ```
+
+  After the next reboot the boot-time displacement lands entirely in zram (~4.3 GB
+  compressed to ~1.5 GB physical in our case, disk swap stays at 0 B) and future
+  pressure spikes cost microseconds instead of SSD reads. Note for benchmarking:
+  numbers taken while a node is thrash-degraded are garbage — reboot first.
+- **Protect the engine from the OOM killer:** Ray sets its workers to
+  `oom_score_adj 1000`, so under true memory exhaustion the kernel kills your
+  100-GB vLLM worker FIRST. `systemd/oomprotect.sh` pins the serving processes to
+  `-500`; wire it into your post-start hook (see `systemd/mimo-fp8kv-post-start.sh`)
+  so it re-applies on every boot.
 - **`fastsafetensors` freezes GB10** — use `--load-format auto`.
 - Never `grep` recursively over `/proc` on GB10 (kcore soft-locks the CPU).
 
