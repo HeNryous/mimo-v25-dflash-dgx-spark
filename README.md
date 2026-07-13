@@ -31,6 +31,16 @@ gh release download prod-overlay-v1 -R HeNryous/mimo-v25-dflash-dgx-spark -D MiM
 #    silently keeps the old 262K RoPE table:
 sudo rm -rf ~/.cache/vllm/torch_compile_cache
 
+# 3b) IMPORTANT — where weights must live: recipe `model:` paths are paths
+#     INSIDE the container. The launcher mounts $HF_HOME (default
+#     ~/.cache/huggingface) to /root/.cache/huggingface, so the assembled
+#     checkpoint must sit at  ~/.cache/huggingface/MiMo-oproj-mxfp8  and the
+#     drafter at  ~/.cache/huggingface/mimo-dflash/dflash  — on BOTH nodes,
+#     same path. If you use a custom HF_HOME, export it on both nodes.
+#
+# 3c) One-time cluster config: node IPs come from .env (CLUSTER_NODES=ip1,ip2)
+#     or run  ./launch-cluster.sh --setup  for autodiscovery.
+#
 # 4) Launch — the recipe applies mods/ at container start (head node, rank 0):
 ./run-recipe.sh -d recipes/mimo-fp8kv-prod.yaml
 
@@ -199,6 +209,10 @@ benchmarks/                    # sampling sweep runner + kernel parity harness (
 [Xiaomi MiMo-V2.5](https://huggingface.co/XiaomiMiMo) ·
 [`lukealonso/MiMo-V2.5-NVFP4`](https://huggingface.co/lukealonso/MiMo-V2.5-NVFP4) ·
 [vLLM](https://github.com/vllm-project/vllm) · DFlash speculative decoding.
+
+The launcher (`run-recipe.sh/.py`, `launch-cluster.sh`, `autodiscover.sh`) is vendored
+from [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) (MIT,
+(c) Eugene Rakhmatulin), including our local fixes that this recipe was validated with.
 Configuration and mods: MIT. Model weights under their own licenses.
 
 **How we got here** — kernel work, A/B data, measured dead ends: **[HISTORY.md](HISTORY.md)**.
