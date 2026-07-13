@@ -134,6 +134,19 @@ measured with neo4j/monitoring/agents co-resident — don't strip services to in
 | `gpu_memory_utilization: 0.86` | hard GB10 ceiling | 0.87/0.88 freeze the node |
 | `--load-format auto` | — | `fastsafetensors` freezes GB10 |
 
+**Run-to-run variance (expected, not a config bug):** temp 0 is NOT
+deterministic on this stack. Batched fp8/MoE kernels are not bitwise
+reproducible (reduction order shifts with batch composition), near-tie logits
+flip tokens, and one flipped token in an agentic chain cascades into a
+different tool call — pass becomes fail. Speculative decoding adds another
+path-dependence. That is why tool-eval is stated as a multi-trial band
+(87 +/- 2, single runs up to 91): a 3-trial mean of ~87 with a Pass@k /
+Pass^k gap of ~15pp on the borderline scenarios reproduces our results
+exactly. Guidance: benchmark with >= 3 trials and report the band; run tool
+workloads with thinking OFF (thinking adds free-form tokens before the tool
+call = more flip opportunities); treat single-run deltas under ~3 points as
+noise.
+
 **Throughput — content-bound reality (measured 2026-07-12, fresh boot)**
 
 DFlash accept-length is set by how predictable the CONTENT is, not by load:
